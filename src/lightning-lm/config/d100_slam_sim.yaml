@@ -1,0 +1,157 @@
+# D100 机器狗 SLAM 仿真建图配置
+# sim_lidar_publisher.py 按 zyurdf-20260522-1 的雷达 site 位姿发布模拟传感器数据
+# 仿真 /imu/data 与 /LIDAR/POINTS 都按 radar_uper_Link 发布，因此 Faster-LIO 外参保持零，不使用 IMU_Link 外参。
+
+common:
+  dataset: "d100_sim"
+  lidar_topic: "/LIDAR/POINTS"
+  livox_lidar_topic: "/livox/lidar"
+  imu_topic: "/imu/data"
+
+fasterlio:
+  lidar_type: 4                # RoboSense
+  scan_line: 32
+  blind: 0.3
+  time_scale: 1e-3
+
+  skip_lidar_num: 0
+  point_filter_num: 4
+  max_iteration: 4
+  filter_size_scan: 0.3
+  filter_size_map: 0.5
+
+  ivox_grid_resolution: 0.5
+  ivox_nearby_type: 18
+  esti_plane_threshold: 0.1
+
+  use_aa: false
+
+  acc_cov: 0.1
+  gyr_cov: 0.1
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
+  extrinsic_est_en: false
+  # 后背雷达内置 IMU -> 后背雷达 LiDAR（同设备，零外参）
+  extrinsic_T: [ 0, 0, 0 ]
+  extrinsic_R: [ 1, 0, 0,
+                 0, 1, 0,
+                 0, 0, 1 ]
+  keep_first_imu_estimation: false
+  kf_dis_th: 1.0              # 关键帧距离阈值 (m)
+  kf_angle_th: 10.0           # 关键帧角度阈值 (deg)
+
+  enable_icp_part: false       # 新版点到点 ICP（可选开启）
+  plane_icp_weight: 300.0
+  min_pts: 500
+  imu_filter: false
+  proj_kfs: false
+
+g2p5:
+  esti_floor: false
+  lidar_height: 0.12
+  floor_height: -0.77
+  min_th_floor: 0.3
+  max_th_floor: 1.5
+  grid_map_resolution: 0.1
+
+system:
+  with_loop_closing: true
+  with_ui: false
+  with_2dui: false
+  with_g2p5: true
+  step_on_kf: false
+
+  enable_lidar_loc_skip: false
+  enable_lidar_loc_rviz: true
+  rviz_current_scan_topic: "/current_scan_cloud"
+  rviz_global_map_topic: "/global_map_cloud"
+  enable_lidar_odom_skip: false
+  evaluation: false
+  lidar_loc_skip_num: 4
+  lidar_odom_skip_num: 2
+  map_path: ./data/d100_slam/
+  pub_tf: false                # TF 由 slam_tf_bridge 管理
+
+loop_closing:
+  loop_kf_gap: 10
+  min_id_interval: 20
+  closest_id_th: 20
+  max_range: 30.0
+  ndt_score_th: 1.0
+  with_height: true
+
+lidar_loc:
+  enable_dynamic_polygon: false
+  enable_parking_static: true
+  enable_icp_adjust: false
+  filter_intensity_max: 100.0
+  filter_intensity_min: 10.0
+  filter_z_max: 30.0
+  filter_z_min: -1.0
+  force_2d: false
+  grid_search_angle_range: 180.0
+  grid_search_angle_step: 60
+  lidar_loc_odom_th: 0.5
+  init_with_fp: true
+  enable_global_relocalization: false
+  global_relocalization_sample_step: 10.0
+  global_relocalization_filter_enable: true
+  global_relocalization_min_chunk_points: 50
+  global_relocalization_grid_resolution: 0.2
+  global_relocalization_obstacle_z_min: 0.15
+  global_relocalization_obstacle_z_max: 1.5
+  global_relocalization_clear_radius: 0.35
+  global_relocalization_support_radius: 2.0
+  global_relocalization_min_support_cells: 10
+  relocalization_margin: 0.3
+  relocalization_top_k: 5
+  relocalization_coarse_yaw_steps: 8
+  auto_relocalization_confirm_frames: 3
+  auto_relocalization_confirm_trans_thresh: 0.3
+  auto_relocalization_confirm_yaw_thresh_deg: 5.0
+  min_init_confidence: 1.8
+  update_dynamic_cloud: true
+  update_err_h: 0.2
+  update_err_v: 0.2
+  update_kf_dis: 2.0
+  update_lidar_loc_score: 2.5
+  loc_on_kf: true
+  try_self_extrap: false
+maps:
+  delete_when_unload: false
+  dyn_cloud_policy: persistent
+  load_dyn_cloud: true
+  load_map_size: 2
+  max_pts_dyn_chunk: 100000
+  save_dyn_when_quit: true
+  save_dyn_when_unload: false
+  unload_map_size: 4
+  with_dyn_area: false
+pgo:
+  dr_ang_noise: 0.5
+  dr_pos_noise: 1.0
+  dr_pos_noise_ratio: 1.0
+  lidar_odom_pos_noise: 0.3
+  lidar_odom_ang_noise: 1.0
+  lidar_loc_pos_noise: 0.3
+  lidar_loc_ang_noise: 1.0
+  lidar_loc_outlier_th: 5.0
+  pgo_frame_converge_pos_th: 0.05
+  pgo_frame_converge_ang_th: 1.0
+  rtk_fix_ang_noise: 2.0
+  rtk_fix_pos_noise: 1.0
+  rtk_height_noise_ratio: 10.0
+  rtk_other_ang_noise: 10.0
+  rtk_other_pos_noise: 5.0
+  rtk_outlier_th: 1.0
+  smooth_factor: 0.01
+roi:
+  height_max: 1.5
+  height_min: -1.0
+  range_max: 50
+  range_min: 0.3
+ui:
+  car_length: 0.7
+  car_width: 0.5
+  car_height: 0.9
+  scans: 1

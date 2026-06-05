@@ -1,0 +1,58 @@
+# Colcon / CMake build outputs
+build/
+install/
+log/
+build_*/
+install_*/
+Log/
+
+# Runtime data, bags, generated maps, and bulky archives
+data/
+ros2_bags/
+*.bag
+*.db3
+*.mcap
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.so
+*.so.*
+*.a
+*.o
+*.pt
+d100_3lidar_rgb_depth_raw_20260529_194631_merged/
+
+# Python and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local shell/editor state
+.bash_history
+.vscode/
+.idea/
+*.log
+*.swp
+
+# External sensor SDKs kept local
+src/OrbbecSDK_ROS2/
+src/rslidar_sdk/
+src/rslidar_msg/
+src/airy lite_sdk/
+OrbbecSDK_ROS2-2-main/
+incoming_from_controller/
+
+# Local runtime and robot description assets not pushed
+docker/
+src/descriptions/
+zyurdf-20260522-1./
+
+# External/large Lightning-LM dependencies and Docker files kept local
+src/lightning-lm/thirdparty/
+src/lightning-lm/docker/
+src/lightning-lm/src/Dockerfile
+src/lightning-lm/src/.dockerignore
+src/lightning-lm/src/compose.yaml
+src/lightning-lm/src/compose.debug.yaml
