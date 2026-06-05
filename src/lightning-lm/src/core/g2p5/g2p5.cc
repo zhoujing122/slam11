@@ -380,15 +380,16 @@ void G2P5::Convert3DTo2DScan(Keyframe::Ptr kf, G2P5MapPtr &map) {
     // step 2, 考察每个雷达原点各方向上的分布曲线
     // 正常场景中，每个方向由较低高度开始（地面），转到较高的高度（物体）
     // 如若不是，那么可能发生了遮挡或进入盲区
-    constexpr double default_ray_distance = -1;
+    constexpr double no_measurement_distance = -1.0;
     const double floor_rh = floor_coeffs_[3];
+    const Vec2d no_measurement(no_measurement_distance, floor_rh);
 
     for (int source_idx = 0; source_idx < source_count; ++source_idx) {
         if (source_valid_counts[source_idx] == 0) {
             continue;
         }
 
-        std::vector<Vec2d> angle_distance_height(360, Vec2d::Zero());
+        std::vector<Vec2d> angle_distance_height(360, no_measurement);
         auto &rays = source_rays[source_idx];
 
         for (int i = 0; i < 360; ++i) {
@@ -397,8 +398,8 @@ void G2P5::Convert3DTo2DScan(Keyframe::Ptr kf, G2P5MapPtr &map) {
             }
 
             if (rays[i].size() < 2) {
-                // 该方向测量数据很少，在16线中是不太可能出现的（至少地面上应该有线），出现，则说明有严重遮挡或失效，认为该方向取一个默认的最小距离（车宽）
-                angle_distance_height[i] = Vec2d(default_ray_distance, floor_rh);
+                // 该方向测量数据很少，认为严重遮挡或失效；保持未知，不做射线清除。
+                angle_distance_height[i] = no_measurement;
                 continue;
             }
 
@@ -456,6 +457,12 @@ void G2P5::SetWhitePoints(const std::vector<Vec2d> &pt2d, Keyframe::Ptr kf, G2P5
         float r = pt2d[i][0];
         float h = pt2d[i][1];
 
+        // Negative distance is NO_MEASUREMENT: keep the area unknown instead of
+        // fabricating a one-meter ray in the opposite direction.
+        if (r < 0) {
+            continue;
+        }
+
         const double local_x = sensor_origin.x() + r * cos(angle);
         const double local_y = sensor_origin.y() + r * sin(angle);
         const double nz = floor_coeffs_[2];
@@ -467,10 +474,10 @@ void G2P5::SetWhitePoints(const std::vector<Vec2d> &pt2d, Keyframe::Ptr kf, G2P5
         Vec3d p_local(local_x, local_y, local_z);
         Vec3d p_world = pose * p_local;
 
-        /// 某方向无测量值时，认为无效
-        if (r <= 0 || r > options_.usable_scan_range_) {
+        /// 过近或超出有效距离时不按正常射线处理；近距离保留局部清除语义。
+        if (r == 0 || r > options_.usable_scan_range_) {
             /// 比较近时，涂白
-            if (r < 0.1) {
+            if (r >= 0 && r < 0.1) {
                 map->SetMissPoint(p_world[0], p_world[1], orig[0], orig[1], h, lidar_height);
             }
             continue;
