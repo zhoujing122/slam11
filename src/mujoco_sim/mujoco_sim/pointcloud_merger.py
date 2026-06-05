@@ -339,6 +339,7 @@ class PointCloudMerger(Node):
     def _back_callback(self, msg):
         cached = self._cached_cloud(msg)
         self._latest_back_timestamp_max = cached.timestamp_max
+        self._process_pending_back_clouds()
         if len(self.back_pending) >= self.max_pending_back_frames:
             dropped = self.back_pending.popleft()
             old = dropped.cached

@@ -722,10 +722,16 @@ void LaserMapping::MapIncremental() {
  */
 void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
     int cnt_pts = scan_down_body_->size();
+    const bool collect_source_stats = log_obs_stats_this_frame_;
 
-    std::vector<char> source_neighbor_found(cnt_pts, 0);
-    std::vector<char> source_plane_fitted(cnt_pts, 0);
-    std::vector<float> source_abs_residual(cnt_pts, 0.0f);
+    std::vector<char> source_neighbor_found;
+    std::vector<char> source_plane_fitted;
+    std::vector<float> source_abs_residual;
+    if (collect_source_stats) {
+        source_neighbor_found.assign(cnt_pts, 0);
+        source_plane_fitted.assign(cnt_pts, 0);
+        source_abs_residual.assign(cnt_pts, 0.0f);
+    }
 
     std::vector<size_t> index(cnt_pts);
     for (size_t i = 0; i < index.size(); ++i) {
@@ -754,7 +760,9 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
                 /** Find the closest surfaces in the map **/
                 ivox_->GetClosestPoint(point_world, points_near, fasterlio::NUM_MATCH_POINTS);
                 point_selected_surf_[i] = points_near.size() >= fasterlio::MIN_NUM_MATCH_POINTS;
-                source_neighbor_found[i] = point_selected_surf_[i];
+                if (collect_source_stats) {
+                    source_neighbor_found[i] = point_selected_surf_[i];
+                }
 
                 point_selected_icp_[i] = point_selected_surf_[i];
 
@@ -762,7 +770,9 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
                 if (point_selected_surf_[i]) {
                     point_selected_surf_[i] =
                         math::esti_plane(plane_coef_[i], points_near, fasterlio::ESTI_PLANE_THRESHOLD);
-                    source_plane_fitted[i] = point_selected_surf_[i];
+                    if (collect_source_stats) {
+                        source_plane_fitted[i] = point_selected_surf_[i];
+                    }
                 }
 
                 /// 计算平面阈值
@@ -774,7 +784,9 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
                     if (p_body.norm() > 81 * pd2 * pd2) {
                         point_selected_surf_[i] = true;
                         residuals_[i] = pd2;
-                        source_abs_residual[i] = std::abs(pd2);
+                        if (collect_source_stats) {
+                            source_abs_residual[i] = std::abs(pd2);
+                        }
                     } else {
                         point_selected_surf_[i] = false;
                     }
@@ -783,7 +795,7 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
         },
         "    ObsModel (Lidar Match)");
 
-    if (log_obs_stats_this_frame_) {
+    if (collect_source_stats) {
         std::array<int, kSourceCount> input_counts{};
         std::array<int, kSourceCount> neighbor_counts{};
         std::array<int, kSourceCount> plane_counts{};
@@ -811,14 +823,14 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
 
         for (int source_idx = 0; source_idx < kSourceCount; ++source_idx) {
             const char *name = source_idx == 0 ? "back" : (source_idx == 1 ? "chin" : "tail");
-            LOG(INFO) << "[ObsModel source stats] " << name << " input=" << input_counts[source_idx]
+            LOG(INFO) << "[ObsModel source stats iter0] " << name << " input=" << input_counts[source_idx]
                       << ", neighbors=" << neighbor_counts[source_idx]
                       << ", plane=" << plane_counts[source_idx] << ", accepted=" << gate_counts[source_idx]
                       << ", median_abs_res=" << Percentile(residuals_by_source[source_idx], 0.5)
                       << ", p90_abs_res=" << Percentile(residuals_by_source[source_idx], 0.9);
         }
         if (invalid_source_id > 0) {
-            LOG(WARNING) << "[ObsModel source stats] invalid_source_id=" << invalid_source_id
+            LOG(WARNING) << "[ObsModel source stats iter0] invalid_source_id=" << invalid_source_id
                          << " after voxel/downsample";
         }
         log_obs_stats_this_frame_ = false;
