@@ -424,11 +424,15 @@ void G2P5::Convert3DTo2DScan(Keyframe::Ptr kf, G2P5MapPtr &map) {
         }
 
         Vec3d sensor_origin = Vec3d::Zero();
-        double lidar_height = options_.lidar_height_;
         if (options_.use_point_source_origin_) {
             sensor_origin = options_.source_origins_[source_idx];
-            lidar_height += sensor_origin.z();
         }
+
+        // Height semantics must match dis_floor above: signed distance from
+        // the sensor origin to the estimated/default floor plane.  Using
+        // options_.lidar_height_ + sensor_origin.z() makes side LiDAR origins
+        // negative when the configured floor is below the back LiDAR frame.
+        const double lidar_height = floor_coeffs_.head<3>().dot(sensor_origin) + floor_coeffs_[3];
 
         // 以2D scan方式添加白色点
         SetWhitePoints(angle_distance_height, kf, map, sensor_origin, lidar_height);

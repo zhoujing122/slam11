@@ -22,6 +22,7 @@ Controlled by parameter ``cache_static_tf`` (default ``True``).
 from collections import deque
 from dataclasses import dataclass
 import math
+import time
 
 import rclpy
 from rclpy.duration import Duration
@@ -56,6 +57,12 @@ class CachedCloud:
     timestamp_max: float
 
 
+@dataclass
+class PendingBackCloud:
+    cached: CachedCloud
+    enqueued_at: float
+
+
 class PointCloudMerger(Node):
     def __init__(self):
         super().__init__("pointcloud_merger")
@@ -74,6 +81,8 @@ class PointCloudMerger(Node):
         self.declare_parameter("cache_static_tf", True)
         self.declare_parameter("tf_lookup_timeout_s", 2.0)
         self.declare_parameter("allow_back_only_fallback", True)
+        self.declare_parameter("side_wait_timeout_s", 0.15)
+        self.declare_parameter("max_pending_back_frames", 3)
         self.declare_parameter("chin_z_offset_m", 0.0)
         self.declare_parameter("tail_z_offset_m", 0.0)
         self.declare_parameter("chin_roll_offset_deg", 0.0)
@@ -117,6 +126,14 @@ class PointCloudMerger(Node):
         self.allow_back_only_fallback = bool(
             self.get_parameter("allow_back_only_fallback").value
         )
+        self.side_wait_timeout_s = max(
+            0.0,
+            float(self.get_parameter("side_wait_timeout_s").value),
+        )
+        self.max_pending_back_frames = max(
+            1,
+            int(self.get_parameter("max_pending_back_frames").value),
+        )
         self.chin_z_offset_m = float(self.get_parameter("chin_z_offset_m").value)
         self.tail_z_offset_m = float(self.get_parameter("tail_z_offset_m").value)
         self.chin_rotation_offset = _rpy_degrees_to_matrix(
@@ -155,7 +172,8 @@ class PointCloudMerger(Node):
 
         self.chin_cache = deque(maxlen=self.cache_size)
         self.tail_cache = deque(maxlen=self.cache_size)
-        self.back_pending = deque(maxlen=self.cache_size)
+        self.back_pending = deque(maxlen=self.max_pending_back_frames)
+        self._latest_back_timestamp_max = None
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -193,6 +211,8 @@ class PointCloudMerger(Node):
         self.get_logger().info(
             "pointcloud_merger: back=%s chin=%s tail=%s -> %s frame=%s "
             "tolerance=%.3fs cache_static_tf=%s tf_timeout=%.1fs "
+            "allow_back_only_fallback=%s side_wait_timeout=%.3fs "
+            "max_pending_back=%d "
             "chin_z_offset=%.3fm tail_z_offset=%.3fm "
             "chin_rpy_offset=[%.2f, %.2f, %.2f]deg "
             "tail_rpy_offset=[%.2f, %.2f, %.2f]deg "
@@ -210,6 +230,9 @@ class PointCloudMerger(Node):
                 self.sync_tolerance_s,
                 self.cache_static_tf,
                 self.tf_lookup_timeout.nanoseconds / 1e9,
+                self.allow_back_only_fallback,
+                self.side_wait_timeout_s,
+                self.max_pending_back_frames,
                 self.chin_z_offset_m,
                 self.tail_z_offset_m,
                 float(self.get_parameter("chin_roll_offset_deg").value),
@@ -244,7 +267,11 @@ class PointCloudMerger(Node):
             "drop_no_chin_tail": 0,
             "drop_tf": 0,
             "drop_merge_error": 0,
+            "drop_pending_overflow": 0,
             "fallback_missing_side": 0,
+            "fallback_back_only_count": 0,
+            "chin_stall_count": 0,
+            "tail_stall_count": 0,
             "points_total": 0,        # sum of merged.width across published frames
             "points_back": 0,
             "points_chin": 0,
@@ -259,6 +286,7 @@ class PointCloudMerger(Node):
             + s["drop_no_chin_tail"]
             + s["drop_tf"]
             + s["drop_merge_error"]
+            + s["drop_pending_overflow"]
         )
         rate_hz = s["published"] / self._stats_period if self._stats_period > 0 else 0.0
         if s["published"] > 0:
@@ -269,14 +297,26 @@ class PointCloudMerger(Node):
         else:
             avg_pts = avg_back = avg_chin = avg_tail = 0
         self.get_logger().info(
-            "stats[%.1fs]: pub=%d (%.1fHz) drop=%d (no_sync=%d, tf=%d, merge=%d, fallback=%d) "
-            "pts/frame=%d (back=%d chin=%d tail=%d) max_sync_dt=%.1fms"
+            "stats[%.1fs]: pub=%d (%.1fHz) drop=%d "
+            "(no_sync=%d, pending_overflow=%d, tf=%d, merge=%d, fallback=%d) "
+            "stalls=(chin=%d tail=%d) pts/frame=%d "
+            "(back=%d chin=%d tail=%d) max_sync_dt=%.1fms"
             % (
                 self._stats_period,
                 s["published"], rate_hz,
-                s["drop_no_chin_tail"] + s["drop_tf"] + s["drop_merge_error"],
-                s["drop_no_chin_tail"], s["drop_tf"], s["drop_merge_error"],
-                s["fallback_missing_side"],
+                (
+                    s["drop_no_chin_tail"]
+                    + s["drop_pending_overflow"]
+                    + s["drop_tf"]
+                    + s["drop_merge_error"]
+                ),
+                s["drop_no_chin_tail"],
+                s["drop_pending_overflow"],
+                s["drop_tf"],
+                s["drop_merge_error"],
+                s["fallback_back_only_count"],
+                s["chin_stall_count"],
+                s["tail_stall_count"],
                 avg_pts, avg_back, avg_chin, avg_tail,
                 s["max_sync_delta_s"] * 1000.0,
             )
@@ -297,7 +337,24 @@ class PointCloudMerger(Node):
         self._process_pending_back_clouds()
 
     def _back_callback(self, msg):
-        self.back_pending.append(self._cached_cloud(msg))
+        cached = self._cached_cloud(msg)
+        self._latest_back_timestamp_max = cached.timestamp_max
+        if len(self.back_pending) >= self.max_pending_back_frames:
+            dropped = self.back_pending.popleft()
+            old = dropped.cached
+            self._stats["drop_pending_overflow"] += 1
+            self.get_logger().warn(
+                "drop pending back cloud: side lidar wait queue overflow "
+                "pending=%d max=%d oldest_window=%.6f..%.6f"
+                % (
+                    len(self.back_pending) + 1,
+                    self.max_pending_back_frames,
+                    old.timestamp_min,
+                    old.timestamp_max,
+                ),
+                throttle_duration_sec=2.0,
+            )
+        self.back_pending.append(PendingBackCloud(cached, time.monotonic()))
         self._process_pending_back_clouds()
 
     def _cached_cloud(self, msg):
@@ -320,12 +377,13 @@ class PointCloudMerger(Node):
 
     def _process_pending_back_clouds(self):
         while self.back_pending:
-            back = self.back_pending[0]
-            if not self._try_publish_back_cloud(back):
+            pending = self.back_pending[0]
+            if not self._try_publish_back_cloud(pending):
                 return
             self.back_pending.popleft()
 
-    def _try_publish_back_cloud(self, back):
+    def _try_publish_back_cloud(self, pending):
+        back = pending.cached
         msg = back.cloud
         target_stamp = back.stamp
         timestamp_window = (back.timestamp_min, back.timestamp_max)
@@ -337,27 +395,53 @@ class PointCloudMerger(Node):
         if not tail_matches:
             missing.append("tail")
 
+        wait_timed_out = False
+        wait_elapsed_s = 0.0
         if missing and should_wait_for_overlapping_clouds(
             timestamp_window,
             missing,
             self.chin_cache,
             self.tail_cache,
         ):
-            return False
+            wait_elapsed_s = self._side_wait_elapsed_s(pending)
+            if wait_elapsed_s < self.side_wait_timeout_s:
+                return False
+            wait_timed_out = True
+            for name in missing:
+                if name == "chin":
+                    self._stats["chin_stall_count"] += 1
+                elif name == "tail":
+                    self._stats["tail_stall_count"] += 1
         if missing:
+            wait_note = (
+                " after waiting %.0fms" % (wait_elapsed_s * 1000.0)
+                if wait_timed_out
+                else ""
+            )
             # Throttle the per-frame warn: stats summary covers the count.
             if not self.allow_back_only_fallback:
                 self._stats["drop_no_chin_tail"] += 1
                 self.get_logger().warn(
-                    "drop back cloud: no %s cloud overlapping %.6f..%.6f"
-                    % ("/".join(missing), timestamp_window[0], timestamp_window[1]),
+                    "drop back cloud%s: no %s cloud overlapping %.6f..%.6f"
+                    % (
+                        wait_note,
+                        "/".join(missing),
+                        timestamp_window[0],
+                        timestamp_window[1],
+                    ),
                     throttle_duration_sec=2.0,
                 )
                 return True
             self._stats["fallback_missing_side"] += 1
+            self._stats["fallback_back_only_count"] += 1
             self.get_logger().warn(
-                "fallback to back cloud only: no %s cloud overlapping %.6f..%.6f"
-                % ("/".join(missing), timestamp_window[0], timestamp_window[1]),
+                "fallback to back cloud only%s: no %s cloud overlapping %.6f..%.6f"
+                % (
+                    wait_note,
+                    "/".join(missing),
+                    timestamp_window[0],
+                    timestamp_window[1],
+                ),
                 throttle_duration_sec=2.0,
             )
 
@@ -431,6 +515,15 @@ class PointCloudMerger(Node):
         output.is_dense = merged.is_dense
         self.publisher.publish(output)
         return True
+
+    def _side_wait_elapsed_s(self, pending):
+        # Wall time handles a live side LiDAR stall; data time keeps rosbag
+        # replay from overflowing pending frames before the wall timeout elapses.
+        elapsed = max(0.0, time.monotonic() - pending.enqueued_at)
+        if self._latest_back_timestamp_max is not None:
+            back_elapsed = self._latest_back_timestamp_max - pending.cached.timestamp_max
+            elapsed = max(elapsed, max(0.0, back_elapsed))
+        return elapsed
 
     def _extra_translation_for_source(self, source_frame):
         if source_frame == "radar_f_Link":
