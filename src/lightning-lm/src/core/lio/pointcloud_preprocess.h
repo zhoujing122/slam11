@@ -64,6 +64,7 @@ class PointCloudPreprocess {
 
     float height_max_ = 1.0;
     float height_min_ = -1.0;
+    int robosense_frame_count_ = 0;
 };
 }  // namespace lightning
 

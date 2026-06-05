@@ -1,6 +1,11 @@
 #include <pcl/common/transforms.h>
 #include <yaml-cpp/yaml.h>
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <fstream>
+#include <string>
+#include <vector>
 
 #include "common/options.h"
 #include "core/lightning_math.hpp"
@@ -14,6 +19,32 @@
 #include "wrapper/ros_utils.h"
 
 namespace lightning {
+namespace {
+constexpr int kSourceCount = 3;
+
+int SourceIndex(float source_id, int &invalid_count) {
+    const float rounded = std::round(source_id);
+    if (std::abs(source_id - rounded) > 1e-3f || rounded < 0.0f || rounded > 2.0f) {
+        invalid_count++;
+        return -1;
+    }
+    return static_cast<int>(rounded);
+}
+
+std::string SourceCountsToString(const std::array<int, kSourceCount> &counts) {
+    return "back=" + std::to_string(counts[0]) + ", chin=" + std::to_string(counts[1]) +
+           ", tail=" + std::to_string(counts[2]);
+}
+
+float Percentile(std::vector<float> values, double q) {
+    if (values.empty()) {
+        return 0.0f;
+    }
+    std::sort(values.begin(), values.end());
+    const size_t idx = std::min(values.size() - 1, static_cast<size_t>(std::round(q * (values.size() - 1))));
+    return values[idx];
+}
+}  // namespace
 
 bool LaserMapping::Init(const std::string &config_yaml) {
     LOG(INFO) << "init laser mapping from " << config_yaml;
@@ -58,6 +89,13 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         lidar_type = yaml["fasterlio"]["lidar_type"].as<int>();
         preprocess_->NumScans() = yaml["fasterlio"]["scan_line"].as<int>();
         preprocess_->PointFilterNum() = yaml["fasterlio"]["point_filter_num"].as<int>();
+        if (yaml["fasterlio"]["lio_mode"]) {
+            lio_mode_ = yaml["fasterlio"]["lio_mode"].as<std::string>();
+        }
+        if (lio_mode_ != "all_legacy" && lio_mode_ != "back_strict") {
+            LOG(WARNING) << "unknown fasterlio.lio_mode=" << lio_mode_ << ", fallback to all_legacy";
+            lio_mode_ = "all_legacy";
+        }
 
         extrinT_ = yaml["fasterlio"]["extrinsic_T"].as<std::vector<double>>();
         extrinR_ = yaml["fasterlio"]["extrinsic_R"].as<std::vector<double>>();
@@ -89,7 +127,7 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         return false;
     }
 
-    LOG(INFO) << "lidar_type " << lidar_type;
+    LOG(INFO) << "lidar_type " << lidar_type << ", lio_mode=" << lio_mode_;
     if (lidar_type == 1) {
         preprocess_->SetLidarType(LidarType::AVIA);
         LOG(INFO) << "Using AVIA Lidar";
@@ -180,14 +218,27 @@ bool LaserMapping::Run() {
         return false;
     }
 
+    lio_frame_count_++;
+    CloudPtr scan_for_lio = BuildLioInputCloud();
+    if (!scan_for_lio || scan_for_lio->empty()) {
+        LOG(WARNING) << "No point for LIO mode " << lio_mode_ << ", skip this scan! full_scan="
+                     << scan_undistort_->size();
+        return false;
+    }
+
+    if (lio_frame_count_ % 20 == 1) {
+        LogCloudSourceStats("full_undistort", scan_undistort_);
+        LogCloudSourceStats("lio_input_pre_voxel", scan_for_lio);
+    }
+
     /// the first scan
     if (flg_first_scan_) {
-        LOG(INFO) << "first scan pts: " << scan_undistort_->size();
+        LOG(INFO) << "first scan pts full=" << scan_undistort_->size() << ", lio=" << scan_for_lio->size();
 
         state_point_ = kf_.GetX();
-        scan_down_world_->resize(scan_undistort_->size());
-        for (int i = 0; i < scan_undistort_->size(); i++) {
-            PointBodyToWorld(scan_undistort_->points[i], scan_down_world_->points[i]);
+        scan_down_world_->resize(scan_for_lio->size());
+        for (size_t i = 0; i < scan_for_lio->size(); i++) {
+            PointBodyToWorld(scan_for_lio->points[i], scan_down_world_->points[i]);
         }
         ivox_->AddPoints(scan_down_world_->points);
 
@@ -225,8 +276,12 @@ bool LaserMapping::Run() {
     flg_EKF_inited_ = (measures_.lidar_begin_time_ - first_lidar_time_) >= fasterlio::INIT_TIME;
 
     /// downsample
-    voxel_scan_.setInputCloud(scan_undistort_);
+    voxel_scan_.setInputCloud(scan_for_lio);
     voxel_scan_.filter(*scan_down_body_);
+
+    if (lio_frame_count_ % 20 == 1) {
+        LogCloudSourceStats("lio_down_post_voxel", scan_down_body_);
+    }
 
     // if (options_.proj_kfs_) {
     //     ProjectKFs();
@@ -234,13 +289,17 @@ bool LaserMapping::Run() {
 
     int cur_pts = scan_down_body_->size();
 
-    if (cur_pts < (scan_undistort_->size() * 0.1) || cur_pts < options_.min_pts) {
+    if (cur_pts < (scan_for_lio->size() * 0.1) || cur_pts < options_.min_pts) {
         /// 降采样太狠了,有效点数不够，用0.1分辨率代替
         // LOG(INFO) << "too few points, using 0.1 resol";
         auto v = voxel_scan_;
         v.setLeafSize(0.1, 0.1, 0.1);
-        v.setInputCloud(scan_undistort_);
+        v.setInputCloud(scan_for_lio);
         v.filter(*scan_down_body_);
+
+        if (lio_frame_count_ % 20 == 1) {
+            LogCloudSourceStats("lio_down_post_voxel_fallback", scan_down_body_);
+        }
 
         // LOG(INFO) << "Now pts: " << scan_down_body_->size() << ", before: " << cur_pts;
         cur_pts = scan_down_body_->size();
@@ -264,7 +323,9 @@ bool LaserMapping::Run() {
     // pred_state.pos_ = state_point_.pos_;  // 假定位置不动行不行,防止速度漂移
     // kf_.ChangeX(pred_state);
 
+    log_obs_stats_this_frame_ = (lio_frame_count_ % 20 == 1);
     kf_.Update(ESKF::ObsType::LIDAR, 1.0);
+    log_obs_stats_this_frame_ = false;
 
     state_point_ = kf_.GetX();
     state_point_.timestamp_ = measures_.lidar_end_time_;
@@ -275,9 +336,9 @@ bool LaserMapping::Run() {
 
     const double current_speed = state_point_.vel_.norm();
 
-    LOG(INFO) << "[ mapping ]: In num: " << scan_undistort_->points.size() << " down " << cur_pts
-              << " Map grid num: " << ivox_->NumValidGrids() << " effect num : " << effect_feat_surf_ << ", "
-              << effect_feat_icp_;
+    LOG(INFO) << "[ mapping ]: In num full: " << scan_undistort_->points.size() << " lio: "
+              << scan_for_lio->points.size() << " down " << cur_pts << " Map grid num: " << ivox_->NumValidGrids()
+              << " effect num : " << effect_feat_surf_ << ", " << effect_feat_icp_;
     LOG(INFO) << "delta trans: " << (pred_state.pos_ - state_point_.pos_).transpose()
               << ", ang: " << delta_rotation_deg;
     // LOG(INFO) << "P diag: " << kf_.GetP().diagonal().transpose();
@@ -361,6 +422,53 @@ void LaserMapping::ProjectKFs(CloudPtr cloud, int size_limit) {
         }
         // }
     }
+}
+
+CloudPtr LaserMapping::BuildLioInputCloud() {
+    if (lio_mode_ != "back_strict") {
+        return scan_undistort_;
+    }
+
+    scan_lio_input_->clear();
+    scan_lio_input_->reserve(scan_undistort_->size());
+    scan_lio_input_->header = scan_undistort_->header;
+    scan_lio_input_->is_dense = scan_undistort_->is_dense;
+
+    int invalid_source_id = 0;
+    for (const auto &pt : scan_undistort_->points) {
+        const int source_idx = SourceIndex(pt.source_id, invalid_source_id);
+        if (source_idx == 0) {
+            scan_lio_input_->points.push_back(pt);
+        }
+    }
+
+    scan_lio_input_->width = scan_lio_input_->points.size();
+    scan_lio_input_->height = 1;
+
+    if (invalid_source_id > 0 && lio_frame_count_ % 20 == 1) {
+        LOG(WARNING) << "back_strict ignored invalid source_id points: " << invalid_source_id;
+    }
+    return scan_lio_input_;
+}
+
+void LaserMapping::LogCloudSourceStats(const std::string &tag, const CloudPtr &cloud) {
+    if (!cloud) {
+        LOG(INFO) << "[LIO source stats] " << tag << " cloud=null";
+        return;
+    }
+
+    std::array<int, kSourceCount> counts{};
+    int invalid_source_id = 0;
+    for (const auto &pt : cloud->points) {
+        const int source_idx = SourceIndex(pt.source_id, invalid_source_id);
+        if (source_idx >= 0) {
+            counts[source_idx]++;
+        }
+    }
+
+    LOG(INFO) << "[LIO source stats] " << tag << " total=" << cloud->points.size() << " ("
+              << SourceCountsToString(counts) << ") invalid_source_id=" << invalid_source_id
+              << ", lio_mode=" << lio_mode_;
 }
 
 void LaserMapping::MakeKF() {
@@ -615,6 +723,10 @@ void LaserMapping::MapIncremental() {
 void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
     int cnt_pts = scan_down_body_->size();
 
+    std::vector<char> source_neighbor_found(cnt_pts, 0);
+    std::vector<char> source_plane_fitted(cnt_pts, 0);
+    std::vector<float> source_abs_residual(cnt_pts, 0.0f);
+
     std::vector<size_t> index(cnt_pts);
     for (size_t i = 0; i < index.size(); ++i) {
         index[i] = i;
@@ -642,6 +754,7 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
                 /** Find the closest surfaces in the map **/
                 ivox_->GetClosestPoint(point_world, points_near, fasterlio::NUM_MATCH_POINTS);
                 point_selected_surf_[i] = points_near.size() >= fasterlio::MIN_NUM_MATCH_POINTS;
+                source_neighbor_found[i] = point_selected_surf_[i];
 
                 point_selected_icp_[i] = point_selected_surf_[i];
 
@@ -649,6 +762,7 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
                 if (point_selected_surf_[i]) {
                     point_selected_surf_[i] =
                         math::esti_plane(plane_coef_[i], points_near, fasterlio::ESTI_PLANE_THRESHOLD);
+                    source_plane_fitted[i] = point_selected_surf_[i];
                 }
 
                 /// 计算平面阈值
@@ -660,6 +774,7 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
                     if (p_body.norm() > 81 * pd2 * pd2) {
                         point_selected_surf_[i] = true;
                         residuals_[i] = pd2;
+                        source_abs_residual[i] = std::abs(pd2);
                     } else {
                         point_selected_surf_[i] = false;
                     }
@@ -667,6 +782,47 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
             });
         },
         "    ObsModel (Lidar Match)");
+
+    if (log_obs_stats_this_frame_) {
+        std::array<int, kSourceCount> input_counts{};
+        std::array<int, kSourceCount> neighbor_counts{};
+        std::array<int, kSourceCount> plane_counts{};
+        std::array<int, kSourceCount> gate_counts{};
+        std::array<std::vector<float>, kSourceCount> residuals_by_source;
+        int invalid_source_id = 0;
+
+        for (int i = 0; i < cnt_pts; ++i) {
+            const int source_idx = SourceIndex(scan_down_body_->points[i].source_id, invalid_source_id);
+            if (source_idx < 0) {
+                continue;
+            }
+            input_counts[source_idx]++;
+            if (source_neighbor_found[i]) {
+                neighbor_counts[source_idx]++;
+            }
+            if (source_plane_fitted[i]) {
+                plane_counts[source_idx]++;
+            }
+            if (point_selected_surf_[i]) {
+                gate_counts[source_idx]++;
+                residuals_by_source[source_idx].push_back(source_abs_residual[i]);
+            }
+        }
+
+        for (int source_idx = 0; source_idx < kSourceCount; ++source_idx) {
+            const char *name = source_idx == 0 ? "back" : (source_idx == 1 ? "chin" : "tail");
+            LOG(INFO) << "[ObsModel source stats] " << name << " input=" << input_counts[source_idx]
+                      << ", neighbors=" << neighbor_counts[source_idx]
+                      << ", plane=" << plane_counts[source_idx] << ", accepted=" << gate_counts[source_idx]
+                      << ", median_abs_res=" << Percentile(residuals_by_source[source_idx], 0.5)
+                      << ", p90_abs_res=" << Percentile(residuals_by_source[source_idx], 0.9);
+        }
+        if (invalid_source_id > 0) {
+            LOG(WARNING) << "[ObsModel source stats] invalid_source_id=" << invalid_source_id
+                         << " after voxel/downsample";
+        }
+        log_obs_stats_this_frame_ = false;
+    }
 
     effect_feat_surf_ = 0;
     effect_feat_icp_ = 0;

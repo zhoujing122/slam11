@@ -18,6 +18,9 @@ fasterlio:
 
   skip_lidar_num: 0
   point_filter_num: 4
+  # all_legacy: three-lidar points feed LIO residuals and IVox as before.
+  # back_strict: source_id=0 feeds LIO residuals and IVox; full scan still feeds keyframes/G2P5.
+  lio_mode: "all_legacy"
   max_iteration: 4
   filter_size_scan: 0.3
   filter_size_map: 0.5

@@ -1,9 +1,30 @@
 #include "pointcloud_preprocess.h"
 #include <execution>
 
+#include <array>
+#include <cmath>
+#include <string>
+
 #include <glog/logging.h>
 
 namespace lightning {
+namespace {
+constexpr int kSourceCount = 3;
+
+int SourceIndex(float source_id, int &invalid_count) {
+    const float rounded = std::round(source_id);
+    if (std::abs(source_id - rounded) > 1e-3f || rounded < 0.0f || rounded > 2.0f) {
+        invalid_count++;
+        return -1;
+    }
+    return static_cast<int>(rounded);
+}
+
+std::string SourceCountsToString(const std::array<int, kSourceCount> &counts) {
+    return "back=" + std::to_string(counts[0]) + ", chin=" + std::to_string(counts[1]) +
+           ", tail=" + std::to_string(counts[2]);
+}
+}  // namespace
 
 void PointCloudPreprocess::Set(LidarType lid_type, double bld, int pfilt_num) {
     lidar_type_ = lid_type;
@@ -144,11 +165,25 @@ void PointCloudPreprocess::RoboSenseHandler(const sensor_msgs::msg::PointCloud2:
 
     double head_time = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
 
+    std::array<int, kSourceCount> raw_counts{};
+    std::array<int, kSourceCount> sampled_counts{};
+    std::array<int, kSourceCount> kept_counts{};
+    int invalid_raw_source_id = 0;
+    int invalid_kept_source_id = 0;
+
     /// RoboSense的时间戳是double, 均为linux时间且单位为秒，这里减去header time并乘以1000得到毫秒为单位的时间戳
 
     for (int i = 0; i < pl_orig.points.size(); i++) {
+        const int raw_source_idx = SourceIndex(pl_orig.points[i].source_id, invalid_raw_source_id);
+        if (raw_source_idx >= 0) {
+            raw_counts[raw_source_idx]++;
+        }
+
         if (i % point_filter_num_ != 0) {
             continue;
+        }
+        if (raw_source_idx >= 0) {
+            sampled_counts[raw_source_idx]++;
         }
 
         double range = pl_orig.points[i].x * pl_orig.points[i].x + pl_orig.points[i].y * pl_orig.points[i].y +
@@ -172,11 +207,26 @@ void PointCloudPreprocess::RoboSenseHandler(const sensor_msgs::msg::PointCloud2:
         added_pt.time = (pl_orig.points[i].timestamp - head_time) * 1e3;  //  / 1e6;  // curvature unit: ms
 
         cloud_out_.points.push_back(added_pt);
+
+        if (raw_source_idx >= 0) {
+            kept_counts[raw_source_idx]++;
+        } else {
+            invalid_kept_source_id++;
+        }
     }
 
     cloud_out_.width = cloud_out_.size();
     cloud_out_.height = 1;
     cloud_out_.is_dense = false;
+
+    robosense_frame_count_++;
+    if (robosense_frame_count_ % 20 == 1) {
+        LOG(INFO) << "[Preprocess source stats] raw(" << SourceCountsToString(raw_counts) << ") sampled("
+                  << SourceCountsToString(sampled_counts) << ") kept(" << SourceCountsToString(kept_counts)
+                  << ") invalid_raw_source_id=" << invalid_raw_source_id
+                  << ", invalid_kept_source_id=" << invalid_kept_source_id
+                  << ", point_filter_num=" << point_filter_num_ << ", blind=" << blind_;
+    }
 }
 
 void PointCloudPreprocess::VelodyneHandler(const sensor_msgs::msg::PointCloud2::SharedPtr &msg) {

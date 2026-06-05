@@ -4,6 +4,7 @@
 #include <pcl/filters/voxel_grid.h>
 #include <condition_variable>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <string>
 #include <thread>
 
 #include "common/eigen_types.h"
@@ -130,9 +131,14 @@ class LaserMapping {
         po.y = p_global(1);
         po.z = p_global(2);
         po.intensity = pi.intensity;
+        po.source_id = pi.source_id;
+        po.time = pi.time;
     }
 
     void MapIncremental();
+
+    CloudPtr BuildLioInputCloud();
+    void LogCloudSourceStats(const std::string &tag, const CloudPtr &cloud);
 
     bool LoadParamsFromYAML(const std::string &yaml);
 
@@ -167,6 +173,7 @@ class LaserMapping {
 
     /// point clouds data
     CloudPtr scan_undistort_{new PointCloudType()};   // scan after undistortion
+    CloudPtr scan_lio_input_{new PointCloudType()};   // scan used by LIO/IVox experiment modes
     CloudPtr scan_down_body_{new PointCloudType()};   // downsampled scan in body
     CloudPtr scan_down_world_{new PointCloudType()};  // downsampled scan in world
     pcl::VoxelGrid<PointType> voxel_scan_;            // voxel filter for current scan
@@ -190,6 +197,7 @@ class LaserMapping {
 
     /// options
     bool keep_first_imu_estimation_ = false;  // 在没有建立地图前，是否要使用前几帧的IMU状态
+    std::string lio_mode_ = "all_legacy";  // all_legacy or back_strict
     double timediff_lidar_wrt_imu_ = 0.0;
     double last_timestamp_lidar_ = 0;
     double lidar_end_time_ = 0;
@@ -204,6 +212,8 @@ class LaserMapping {
     /// statistics and flags ///
     int scan_count_ = 0;
     int publish_count_ = 0;
+    int lio_frame_count_ = 0;
+    bool log_obs_stats_this_frame_ = false;
     bool flg_first_scan_ = true;
     bool flg_EKF_inited_ = false;
     double lidar_mean_scantime_ = 0.0;
