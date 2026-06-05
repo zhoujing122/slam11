@@ -6,6 +6,7 @@
 #include "common/constant.h"
 
 #include <algorithm>
+#include <cmath>
 #include <pcl/ModelCoefficients.h>
 #include <pcl/sample_consensus/method_types.h>
 #include <pcl/sample_consensus/model_types.h>
@@ -455,8 +456,15 @@ void G2P5::SetWhitePoints(const std::vector<Vec2d> &pt2d, Keyframe::Ptr kf, G2P5
         float r = pt2d[i][0];
         float h = pt2d[i][1];
 
-        Vec3d p_local(sensor_origin.x() + r * cos(angle), sensor_origin.y() + r * sin(angle),
-                      sensor_origin.z() + h);
+        const double local_x = sensor_origin.x() + r * cos(angle);
+        const double local_y = sensor_origin.y() + r * sin(angle);
+        const double nz = floor_coeffs_[2];
+        const double local_z = std::abs(nz) > 1e-6
+                                 ? (h - floor_coeffs_[3] - floor_coeffs_[0] * local_x -
+                                    floor_coeffs_[1] * local_y) /
+                                       nz
+                                 : sensor_origin.z() + h;
+        Vec3d p_local(local_x, local_y, local_z);
         Vec3d p_world = pose * p_local;
 
         /// 某方向无测量值时，认为无效
