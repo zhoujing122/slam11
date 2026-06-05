@@ -44,6 +44,22 @@ float Percentile(std::vector<float> values, double q) {
     const size_t idx = std::min(values.size() - 1, static_cast<size_t>(std::round(q * (values.size() - 1))));
     return values[idx];
 }
+
+bool IsAllowedKeyframeSource(int source_idx, const std::string &mode) {
+    if (mode == "all") {
+        return true;
+    }
+    if (mode == "back_only") {
+        return source_idx == 0;
+    }
+    if (mode == "back_chin") {
+        return source_idx == 0 || source_idx == 1;
+    }
+    if (mode == "back_tail") {
+        return source_idx == 0 || source_idx == 2;
+    }
+    return true;
+}
 }  // namespace
 
 bool LaserMapping::Init(const std::string &config_yaml) {
@@ -96,6 +112,14 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
             LOG(WARNING) << "unknown fasterlio.lio_mode=" << lio_mode_ << ", fallback to all_legacy";
             lio_mode_ = "all_legacy";
         }
+        if (yaml["fasterlio"]["keyframe_source_mode"]) {
+            keyframe_source_mode_ = yaml["fasterlio"]["keyframe_source_mode"].as<std::string>();
+        }
+        if (keyframe_source_mode_ != "all" && keyframe_source_mode_ != "back_only" &&
+            keyframe_source_mode_ != "back_chin" && keyframe_source_mode_ != "back_tail") {
+            LOG(WARNING) << "unknown fasterlio.keyframe_source_mode=" << keyframe_source_mode_ << ", fallback to all";
+            keyframe_source_mode_ = "all";
+        }
 
         extrinT_ = yaml["fasterlio"]["extrinsic_T"].as<std::vector<double>>();
         extrinR_ = yaml["fasterlio"]["extrinsic_R"].as<std::vector<double>>();
@@ -127,7 +151,8 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         return false;
     }
 
-    LOG(INFO) << "lidar_type " << lidar_type << ", lio_mode=" << lio_mode_;
+    LOG(INFO) << "lidar_type " << lidar_type << ", lio_mode=" << lio_mode_
+              << ", keyframe_source_mode=" << keyframe_source_mode_;
     if (lidar_type == 1) {
         preprocess_->SetLidarType(LidarType::AVIA);
         LOG(INFO) << "Using AVIA Lidar";
@@ -451,6 +476,38 @@ CloudPtr LaserMapping::BuildLioInputCloud() {
     return scan_lio_input_;
 }
 
+CloudPtr LaserMapping::BuildKeyframeCloud() {
+    if (keyframe_source_mode_ == "all") {
+        return scan_undistort_;
+    }
+
+    CloudPtr cloud(new PointCloudType());
+    cloud->reserve(scan_undistort_->size());
+    cloud->header = scan_undistort_->header;
+    cloud->is_dense = scan_undistort_->is_dense;
+
+    int invalid_source_id = 0;
+    for (const auto &pt : scan_undistort_->points) {
+        const int source_idx = SourceIndex(pt.source_id, invalid_source_id);
+        if (source_idx >= 0 && IsAllowedKeyframeSource(source_idx, keyframe_source_mode_)) {
+            cloud->points.push_back(pt);
+        }
+    }
+
+    cloud->width = cloud->points.size();
+    cloud->height = 1;
+
+    if (invalid_source_id > 0 && lio_frame_count_ % 20 == 1) {
+        LOG(WARNING) << "keyframe source filter ignored invalid source_id points: " << invalid_source_id;
+    }
+    if (cloud->empty()) {
+        LOG(WARNING) << "keyframe_source_mode=" << keyframe_source_mode_
+                     << " produced empty keyframe cloud; fallback to full scan";
+        return scan_undistort_;
+    }
+    return cloud;
+}
+
 void LaserMapping::LogCloudSourceStats(const std::string &tag, const CloudPtr &cloud) {
     if (!cloud) {
         LOG(INFO) << "[LIO source stats] " << tag << " cloud=null";
@@ -472,7 +529,11 @@ void LaserMapping::LogCloudSourceStats(const std::string &tag, const CloudPtr &c
 }
 
 void LaserMapping::MakeKF() {
-    Keyframe::Ptr kf = std::make_shared<Keyframe>(kf_id_++, scan_undistort_, state_point_);
+    CloudPtr keyframe_cloud = BuildKeyframeCloud();
+    if (lio_frame_count_ % 20 == 1) {
+        LogCloudSourceStats("keyframe_input", keyframe_cloud);
+    }
+    Keyframe::Ptr kf = std::make_shared<Keyframe>(kf_id_++, keyframe_cloud, state_point_);
 
     if (last_kf_) {
         /// opt pose 用之前的递推

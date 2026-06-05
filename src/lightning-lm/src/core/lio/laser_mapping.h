@@ -138,6 +138,7 @@ class LaserMapping {
     void MapIncremental();
 
     CloudPtr BuildLioInputCloud();
+    CloudPtr BuildKeyframeCloud();
     void LogCloudSourceStats(const std::string &tag, const CloudPtr &cloud);
 
     bool LoadParamsFromYAML(const std::string &yaml);
@@ -197,7 +198,8 @@ class LaserMapping {
 
     /// options
     bool keep_first_imu_estimation_ = false;  // 在没有建立地图前，是否要使用前几帧的IMU状态
-    std::string lio_mode_ = "all_legacy";  // all_legacy or back_strict
+    std::string lio_mode_ = "all_legacy";            // all_legacy or back_strict
+    std::string keyframe_source_mode_ = "all";       // all, back_only, back_chin, or back_tail
     double timediff_lidar_wrt_imu_ = 0.0;
     double last_timestamp_lidar_ = 0;
     double lidar_end_time_ = 0;
