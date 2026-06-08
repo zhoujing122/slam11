@@ -10,6 +10,16 @@ common:
   livox_lidar_topic: "/livox/lidar"
   imu_topic: "/imu/data"
 
+cloud_topics:
+  lio_cloud_topic: "/LIDAR/POINTS"
+  mapping_cloud_topic: "/merged/LIDAR/POINTS"
+
+split_pipeline:
+  enabled: true
+  trajectory_buffer_s: 3.0
+  map_cloud_max_delay_s: 1.5
+  pending_keyframe_limit: 30
+
 fasterlio:
   lidar_type: 4
   scan_line: 32
@@ -20,7 +30,7 @@ fasterlio:
   point_filter_num: 4
   # all_legacy: three-lidar points feed LIO residuals and IVox as before.
   # back_strict: source_id=0 feeds LIO residuals and IVox.
-  lio_mode: "all_legacy"
+  lio_mode: "back_strict"
   # Keyframe/G2P5 map input source selection: all, back_only, back_chin, back_tail.
   keyframe_source_mode: "all"
   max_iteration: 4

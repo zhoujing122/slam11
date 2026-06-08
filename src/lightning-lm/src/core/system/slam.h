@@ -12,6 +12,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <deque>
 #include <string>
 
 #include "lightning/msg/nav_state.hpp"
@@ -76,6 +77,7 @@ class SlamSystem {
     /// 处理点云
     void ProcessLidar(const sensor_msgs::msg::PointCloud2::SharedPtr& cloud);
     void ProcessLidar(const livox_ros_driver2::msg::CustomMsg::SharedPtr& cloud);
+    void ProcessMappingLidar(const sensor_msgs::msg::PointCloud2::SharedPtr& cloud);
 
     /// 实时模式下的spin
     void Spin();
@@ -109,6 +111,22 @@ class SlamSystem {
     std::string rviz_scan_topic_ = "/current_scan_cloud";
     std::string rviz_map_topic_ = "/global_map_cloud";
 
+    struct PendingMapCloud {
+        double begin_time = 0.0;
+        double end_time = 0.0;
+        double header_time = 0.0;
+        CloudPtr cloud = nullptr;
+    };
+
+    struct PendingKeyframe {
+        Keyframe::Ptr kf = nullptr;
+        double reference_time = 0.0;
+    };
+
+    void HandleReadyKeyframe(const Keyframe::Ptr& kf, const CloudPtr& scan_for_rviz);
+    void QueuePendingKeyframe(const Keyframe::Ptr& kf);
+    void TryPublishPendingKeyframes();
+
     /// 发布ROS2话题
     void PublishOdom(const NavState& state, double timestamp);
     void PublishScan(const CloudPtr& cloud, const SE3& pose, double timestamp);
@@ -128,9 +146,19 @@ class SlamSystem {
     std::string imu_topic_;
     std::string cloud_topic_;
     std::string livox_topic_;
+    std::string lio_cloud_topic_;
+    std::string mapping_cloud_topic_;
+
+    bool split_pipeline_enabled_ = false;
+    double trajectory_buffer_s_ = 3.0;
+    double map_cloud_max_delay_s_ = 1.5;
+    size_t pending_keyframe_limit_ = 30;
+    std::deque<PendingMapCloud> pending_map_clouds_;
+    std::deque<PendingKeyframe> pending_keyframes_;
 
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_ = nullptr;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_ = nullptr;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr mapping_cloud_sub_ = nullptr;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr livox_sub_ = nullptr;
 };
 }  // namespace lightning

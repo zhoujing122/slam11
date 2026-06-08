@@ -49,8 +49,18 @@ int main(int argc, char** argv) {
     lightning::YAML_IO yaml(FLAGS_config);
     std::string lidar_topic = yaml.GetValue<std::string>("common", "lidar_topic");
     std::string imu_topic = yaml.GetValue<std::string>("common", "imu_topic");
+    bool split_pipeline_enabled = yaml.HasKey("split_pipeline", "enabled") &&
+                                  yaml.GetValue<bool>("split_pipeline", "enabled");
+    std::string lio_cloud_topic = lidar_topic;
+    std::string mapping_cloud_topic = lidar_topic;
+    if (split_pipeline_enabled && yaml.HasKey("cloud_topics", "lio_cloud_topic")) {
+        lio_cloud_topic = yaml.GetValue<std::string>("cloud_topics", "lio_cloud_topic");
+    }
+    if (split_pipeline_enabled && yaml.HasKey("cloud_topics", "mapping_cloud_topic")) {
+        mapping_cloud_topic = yaml.GetValue<std::string>("cloud_topics", "mapping_cloud_topic");
+    }
 
-    rosbag
+    auto& bag_pipeline = rosbag
         /// IMU 的处理
         .AddImuHandle(imu_topic,
                       [&slam](IMUPtr imu) {
@@ -59,11 +69,21 @@ int main(int argc, char** argv) {
                       })
 
         /// lidar 的处理
-        .AddPointCloud2Handle(lidar_topic,
+        .AddPointCloud2Handle(lio_cloud_topic,
                               [&slam](sensor_msgs::msg::PointCloud2::SharedPtr msg) {
                                   slam.ProcessLidar(msg);
                                   return true;
-                              })
+                              });
+
+    if (split_pipeline_enabled && mapping_cloud_topic != lio_cloud_topic) {
+        bag_pipeline.AddPointCloud2Handle(mapping_cloud_topic,
+                                          [&slam](sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+                                              slam.ProcessMappingLidar(msg);
+                                              return true;
+                                          });
+    }
+
+    bag_pipeline
         /// livox 的处理
         .AddLivoxCloudHandle("/livox/lidar",
                              [&slam](livox_ros_driver2::msg::CustomMsg::SharedPtr cloud) {

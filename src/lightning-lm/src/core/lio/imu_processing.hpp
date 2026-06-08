@@ -42,6 +42,8 @@ class ImuProcess {
     void SetUseIMUFilter(bool b) { use_imu_filter_ = b; }
 
     double GetMeanAccNorm() const { return mean_acc_.norm(); }
+    const std::vector<Pose6D>& GetLastImuPose() const { return imu_pose_; }
+    const NavState& GetLastLidarEndStateBeforeUpdate() const { return last_lidar_end_state_; }
 
     Eigen::Matrix<double, 12, 12> Q_;
     Vec3d cov_acc_;
@@ -62,6 +64,7 @@ class ImuProcess {
     std::deque<lightning::IMUPtr> imu_queue_;
 
     std::vector<Pose6D> imu_pose_;
+    NavState last_lidar_end_state_;
     Mat3d R_lidar_imu_ = Mat3d ::Identity();
     Vec3d t_lidar_mu_ = Vec3d ::Zero();
     Vec3d mean_acc_ = Vec3d::Zero();
@@ -256,6 +259,7 @@ inline void ImuProcess::UndistortPcl(const MeasureGroup &meas, ESKF &kf_state, C
     kf_state.Predict(dt, Q_, gyro, acc);
 
     imu_state = kf_state.GetX();
+    last_lidar_end_state_ = imu_state;
     last_imu_ = meas.imu_.back();
     last_lidar_end_time_ = pcl_end_time;
 

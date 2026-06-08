@@ -28,6 +28,11 @@ class Keyframe {
     unsigned long GetID() const { return id_; }
     CloudPtr GetCloud() const { return cloud_; }
 
+    void SetCloud(CloudPtr cloud) {
+        UL lock(data_mutex_);
+        cloud_ = cloud;
+    }
+
     SE3 GetLIOPose() {
         UL lock(data_mutex_);
         return pose_lio_;

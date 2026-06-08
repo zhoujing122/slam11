@@ -24,6 +24,15 @@ std::string SourceCountsToString(const std::array<int, kSourceCount> &counts) {
     return "back=" + std::to_string(counts[0]) + ", chin=" + std::to_string(counts[1]) +
            ", tail=" + std::to_string(counts[2]);
 }
+
+bool HasPointField(const sensor_msgs::msg::PointCloud2::SharedPtr &msg, const std::string &name) {
+    for (const auto &field : msg->fields) {
+        if (field.name == name) {
+            return true;
+        }
+    }
+    return false;
+}
 }  // namespace
 
 void PointCloudPreprocess::Set(LidarType lid_type, double bld, int pfilt_num) {
@@ -164,6 +173,7 @@ void PointCloudPreprocess::RoboSenseHandler(const sensor_msgs::msg::PointCloud2:
     cloud_out_.reserve(plsize);
 
     double head_time = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
+    const bool has_source_id = HasPointField(msg, "source_id");
 
     std::array<int, kSourceCount> raw_counts{};
     std::array<int, kSourceCount> sampled_counts{};
@@ -174,7 +184,8 @@ void PointCloudPreprocess::RoboSenseHandler(const sensor_msgs::msg::PointCloud2:
     /// RoboSense的时间戳是double, 均为linux时间且单位为秒，这里减去header time并乘以1000得到毫秒为单位的时间戳
 
     for (int i = 0; i < pl_orig.points.size(); i++) {
-        const int raw_source_idx = SourceIndex(pl_orig.points[i].source_id, invalid_raw_source_id);
+        const float raw_source_id = has_source_id ? pl_orig.points[i].source_id : 0.0f;
+        const int raw_source_idx = SourceIndex(raw_source_id, invalid_raw_source_id);
         if (raw_source_idx >= 0) {
             raw_counts[raw_source_idx]++;
         }
@@ -202,7 +213,7 @@ void PointCloudPreprocess::RoboSenseHandler(const sensor_msgs::msg::PointCloud2:
         added_pt.y = pl_orig.points[i].y;
         added_pt.z = pl_orig.points[i].z;
         added_pt.intensity = pl_orig.points[i].intensity;
-        added_pt.source_id = pl_orig.points[i].source_id;
+        added_pt.source_id = raw_source_id;
 
         added_pt.time = (pl_orig.points[i].timestamp - head_time) * 1e3;  //  / 1e6;  // curvature unit: ms
 
@@ -225,6 +236,7 @@ void PointCloudPreprocess::RoboSenseHandler(const sensor_msgs::msg::PointCloud2:
                   << SourceCountsToString(sampled_counts) << ") kept(" << SourceCountsToString(kept_counts)
                   << ") invalid_raw_source_id=" << invalid_raw_source_id
                   << ", invalid_kept_source_id=" << invalid_kept_source_id
+                  << ", source_id_field=" << (has_source_id ? "yes" : "no")
                   << ", point_filter_num=" << point_filter_num_ << ", blind=" << blind_;
     }
 }

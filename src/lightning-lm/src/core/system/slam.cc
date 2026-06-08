@@ -16,6 +16,7 @@
 #include <yaml-cpp/yaml.h>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <opencv2/opencv.hpp>
 
 namespace lightning {
@@ -38,6 +39,37 @@ bool SlamSystem::Init(const std::string& yaml_path) {
     options_.with_2dvisualization_ = yaml["system"]["with_2dui"].as<bool>();
     options_.with_gridmap_ = yaml["system"]["with_g2p5"].as<bool>();
     options_.step_on_kf_ = yaml["system"]["step_on_kf"].as<bool>();
+
+    imu_topic_ = yaml["common"]["imu_topic"].as<std::string>();
+    cloud_topic_ = yaml["common"]["lidar_topic"].as<std::string>();
+    livox_topic_ = yaml["common"]["livox_lidar_topic"].as<std::string>();
+    lio_cloud_topic_ = cloud_topic_;
+    mapping_cloud_topic_ = cloud_topic_;
+
+    if (yaml["cloud_topics"]) {
+        if (yaml["cloud_topics"]["lio_cloud_topic"]) {
+            lio_cloud_topic_ = yaml["cloud_topics"]["lio_cloud_topic"].as<std::string>();
+        }
+        if (yaml["cloud_topics"]["mapping_cloud_topic"]) {
+            mapping_cloud_topic_ = yaml["cloud_topics"]["mapping_cloud_topic"].as<std::string>();
+        }
+    }
+
+    if (yaml["split_pipeline"]) {
+        if (yaml["split_pipeline"]["enabled"]) {
+            split_pipeline_enabled_ = yaml["split_pipeline"]["enabled"].as<bool>();
+        }
+        if (yaml["split_pipeline"]["trajectory_buffer_s"]) {
+            trajectory_buffer_s_ = yaml["split_pipeline"]["trajectory_buffer_s"].as<double>();
+        }
+        if (yaml["split_pipeline"]["map_cloud_max_delay_s"]) {
+            map_cloud_max_delay_s_ = yaml["split_pipeline"]["map_cloud_max_delay_s"].as<double>();
+        }
+        if (yaml["split_pipeline"]["pending_keyframe_limit"]) {
+            pending_keyframe_limit_ = yaml["split_pipeline"]["pending_keyframe_limit"].as<size_t>();
+        }
+    }
+    lio_->ConfigureSplitPipeline(split_pipeline_enabled_, trajectory_buffer_s_);
 
     if (options_.with_loop_closing_) {
         LOG(INFO) << "slam with loop closing";
@@ -88,10 +120,6 @@ bool SlamSystem::Init(const std::string& yaml_path) {
         /// subscribers
         node_ = std::make_shared<rclcpp::Node>("lightning_slam");
 
-        imu_topic_ = yaml["common"]["imu_topic"].as<std::string>();
-        cloud_topic_ = yaml["common"]["lidar_topic"].as<std::string>();
-        livox_topic_ = yaml["common"]["livox_lidar_topic"].as<std::string>();
-
         rclcpp::QoS qos(10);
         // qos.best_effort();
 
@@ -107,10 +135,23 @@ bool SlamSystem::Init(const std::string& yaml_path) {
                 ProcessIMU(imu);
             });
 
-        cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-            cloud_topic_, qos, [this](sensor_msgs::msg::PointCloud2::SharedPtr cloud) {
-                Timer::Evaluate([&]() { ProcessLidar(cloud); }, "Proc Lidar", true);
-            });
+        if (split_pipeline_enabled_) {
+            LOG(INFO) << "split cloud pipeline enabled, lio_cloud_topic=" << lio_cloud_topic_
+                      << ", mapping_cloud_topic=" << mapping_cloud_topic_;
+            cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+                lio_cloud_topic_, qos, [this](sensor_msgs::msg::PointCloud2::SharedPtr cloud) {
+                    Timer::Evaluate([&]() { ProcessLidar(cloud); }, "Proc Lio Lidar", true);
+                });
+            mapping_cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+                mapping_cloud_topic_, qos, [this](sensor_msgs::msg::PointCloud2::SharedPtr cloud) {
+                    Timer::Evaluate([&]() { ProcessMappingLidar(cloud); }, "Proc Mapping Lidar", true);
+                });
+        } else {
+            cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+                cloud_topic_, qos, [this](sensor_msgs::msg::PointCloud2::SharedPtr cloud) {
+                    Timer::Evaluate([&]() { ProcessLidar(cloud); }, "Proc Lidar", true);
+                });
+        }
 
         livox_sub_ = node_->create_subscription<livox_ros_driver2::msg::CustomMsg>(
             livox_topic_, qos, [this](livox_ros_driver2::msg::CustomMsg ::SharedPtr cloud) {
@@ -315,28 +356,12 @@ void SlamSystem::ProcessLidar(const sensor_msgs::msg::PointCloud2::SharedPtr& cl
         return;
     }
 
-    if (options_.with_loop_closing_) {
-        lc_->AddKF(cur_kf_);
+    if (split_pipeline_enabled_) {
+        QueuePendingKeyframe(cur_kf_);
+        return;
     }
 
-    if (options_.with_gridmap_) {
-        g2p5_->PushKeyframe(cur_kf_);
-    }
-
-    if (ui_) {
-        ui_->UpdateKF(cur_kf_);
-    }
-
-    /// 发布点云和地图（关键帧时）
-    if (options_.online_mode_) {
-        if (enable_rviz_) {
-            PublishScan(lio_->GetScanUndist(), state.GetPose(), state.timestamp_);
-            kf_count_++;
-            if (kf_count_ % 3 == 0) {
-                PublishGlobalMap(state.timestamp_);
-            }
-        }
-    }
+    HandleReadyKeyframe(cur_kf_, lio_->GetScanUndist());
 }
 
 void SlamSystem::ProcessLidar(const livox_ros_driver2::msg::CustomMsg::SharedPtr& cloud) {
@@ -364,26 +389,131 @@ void SlamSystem::ProcessLidar(const livox_ros_driver2::msg::CustomMsg::SharedPtr
         return;
     }
 
+    if (split_pipeline_enabled_) {
+        QueuePendingKeyframe(cur_kf_);
+        return;
+    }
+
+    HandleReadyKeyframe(cur_kf_, lio_->GetScanUndist());
+}
+
+void SlamSystem::ProcessMappingLidar(const sensor_msgs::msg::PointCloud2::SharedPtr& cloud_msg) {
+    if (running_ == false || !split_pipeline_enabled_) {
+        return;
+    }
+
+    CloudPtr cloud = lio_->PreprocessMapPointCloud2(cloud_msg);
+    if (!cloud || cloud->empty()) {
+        return;
+    }
+
+    const double header_time = ToSec(cloud_msg->header.stamp);
+    double begin_time = std::numeric_limits<double>::max();
+    double end_time = std::numeric_limits<double>::lowest();
+    for (const auto& pt : cloud->points) {
+        const double point_time = header_time + pt.time / 1000.0;
+        begin_time = std::min(begin_time, point_time);
+        end_time = std::max(end_time, point_time);
+    }
+
+    PendingMapCloud pending;
+    pending.begin_time = begin_time;
+    pending.end_time = end_time;
+    pending.header_time = header_time;
+    pending.cloud = cloud;
+    pending_map_clouds_.push_back(pending);
+
+    while (pending_map_clouds_.size() > pending_keyframe_limit_ * 2) {
+        pending_map_clouds_.pop_front();
+    }
+
+    TryPublishPendingKeyframes();
+}
+
+void SlamSystem::HandleReadyKeyframe(const Keyframe::Ptr& kf, const CloudPtr& scan_for_rviz) {
+    if (kf == nullptr) {
+        return;
+    }
+
     if (options_.with_loop_closing_) {
-        lc_->AddKF(cur_kf_);
+        lc_->AddKF(kf);
     }
 
     if (options_.with_gridmap_) {
-        g2p5_->PushKeyframe(cur_kf_);
+        g2p5_->PushKeyframe(kf);
     }
 
     if (ui_) {
-        ui_->UpdateKF(cur_kf_);
+        ui_->UpdateKF(kf);
     }
 
-    if (options_.online_mode_) {
-        if (enable_rviz_) {
-            PublishScan(lio_->GetScanUndist(), state.GetPose(), state.timestamp_);
-            kf_count_++;
-            if (kf_count_ % 3 == 0) {
-                PublishGlobalMap(state.timestamp_);
+    if (options_.online_mode_ && enable_rviz_) {
+        auto state = kf->GetState();
+        PublishScan(scan_for_rviz, state.GetPose(), state.timestamp_);
+        kf_count_++;
+        if (kf_count_ % 3 == 0) {
+            PublishGlobalMap(state.timestamp_);
+        }
+    }
+}
+
+void SlamSystem::QueuePendingKeyframe(const Keyframe::Ptr& kf) {
+    if (kf == nullptr) {
+        return;
+    }
+
+    PendingKeyframe pending;
+    pending.kf = kf;
+    pending.reference_time = kf->GetState().timestamp_;
+    pending_keyframes_.push_back(pending);
+
+    while (pending_keyframes_.size() > pending_keyframe_limit_) {
+        pending_keyframes_.pop_front();
+    }
+
+    TryPublishPendingKeyframes();
+}
+
+void SlamSystem::TryPublishPendingKeyframes() {
+    if (!split_pipeline_enabled_) {
+        return;
+    }
+
+    while (!pending_keyframes_.empty()) {
+        auto& pending_kf = pending_keyframes_.front();
+        while (!pending_map_clouds_.empty() && pending_map_clouds_.front().end_time < pending_kf.reference_time) {
+            pending_map_clouds_.pop_front();
+        }
+
+        auto match = pending_map_clouds_.end();
+        for (auto it = pending_map_clouds_.begin(); it != pending_map_clouds_.end(); ++it) {
+            if (it->begin_time <= pending_kf.reference_time && pending_kf.reference_time <= it->end_time) {
+                match = it;
+                break;
             }
         }
+
+        if (match == pending_map_clouds_.end()) {
+            if (!pending_map_clouds_.empty() &&
+                pending_map_clouds_.front().begin_time > pending_kf.reference_time + map_cloud_max_delay_s_) {
+                LOG(WARNING) << "drop split-pipeline keyframe without matching map cloud, kf_time="
+                             << pending_kf.reference_time << ", first_map_begin="
+                             << pending_map_clouds_.front().begin_time;
+                pending_keyframes_.pop_front();
+                continue;
+            }
+            break;
+        }
+
+        CloudPtr deskewed = lio_->DeskewMapCloud(match->cloud, match->header_time, pending_kf.reference_time);
+        if (!deskewed || deskewed->empty()) {
+            break;
+        }
+
+        pending_kf.kf->SetCloud(deskewed);
+        HandleReadyKeyframe(pending_kf.kf, deskewed);
+        pending_map_clouds_.erase(match);
+        pending_keyframes_.pop_front();
     }
 }
 

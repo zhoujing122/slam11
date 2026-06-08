@@ -54,6 +54,18 @@ class LaserMapping {
 
     using IVoxType = IVox<3, IVoxNodeType::DEFAULT, PointType>;
 
+    struct TrajectoryPose {
+        double timestamp = 0.0;
+        Vec3d pos = Vec3d::Zero();
+        SO3 rot;
+    };
+
+    struct TrajectorySegment {
+        double begin_time = 0.0;
+        double end_time = 0.0;
+        std::vector<TrajectoryPose> poses;
+    };
+
     LaserMapping(Options options = Options());
     ~LaserMapping() {
         scan_down_body_ = nullptr;
@@ -76,6 +88,11 @@ class LaserMapping {
 
     /// 如果已经做了预处理，也可以直接处理点云
     void ProcessPointCloud2(CloudPtr cloud);
+
+    void ConfigureSplitPipeline(bool enabled, double trajectory_buffer_s);
+    CloudPtr PreprocessMapPointCloud2(const sensor_msgs::msg::PointCloud2::SharedPtr &msg);
+    CloudPtr DeskewMapCloud(const CloudPtr &cloud, double cloud_header_time, double reference_time) const;
+    bool HasTrajectoryFor(double begin_time, double end_time) const;
 
     void ProcessIMU(const lightning::IMUPtr &msg_in);
 
@@ -140,6 +157,9 @@ class LaserMapping {
     CloudPtr BuildLioInputCloud();
     CloudPtr BuildKeyframeCloud();
     void LogCloudSourceStats(const std::string &tag, const CloudPtr &cloud);
+    void RecordTrajectorySegment();
+    const TrajectorySegment *FindTrajectorySegment(double begin_time, double end_time) const;
+    bool EvaluateTrajectoryPose(const TrajectorySegment &segment, double timestamp, SE3 &pose) const;
 
     bool LoadParamsFromYAML(const std::string &yaml);
 
@@ -157,6 +177,10 @@ class LaserMapping {
     std::shared_ptr<IVoxType> ivox_ = nullptr;                    // localmap in ivox
     std::shared_ptr<PointCloudPreprocess> preprocess_ = nullptr;  // point cloud preprocess
     std::shared_ptr<ImuProcess> p_imu_ = nullptr;                 // imu process
+
+    bool split_pipeline_enabled_ = false;
+    double trajectory_buffer_s_ = 3.0;
+    std::deque<TrajectorySegment> trajectory_history_;
 
     /// local map related
     double filter_size_map_min_ = 0;

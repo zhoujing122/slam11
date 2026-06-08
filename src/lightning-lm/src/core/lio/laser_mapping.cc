@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -201,6 +202,168 @@ LaserMapping::LaserMapping(Options options) : options_(options) {
     p_imu_.reset(new ImuProcess());
 }
 
+void LaserMapping::ConfigureSplitPipeline(bool enabled, double trajectory_buffer_s) {
+    split_pipeline_enabled_ = enabled;
+    trajectory_buffer_s_ = trajectory_buffer_s;
+}
+
+CloudPtr LaserMapping::PreprocessMapPointCloud2(const sensor_msgs::msg::PointCloud2::SharedPtr &msg) {
+    CloudPtr cloud(new PointCloudType());
+    preprocess_->Process(msg, cloud);
+    pcl_conversions::toPCL(msg->header, cloud->header);
+    return cloud;
+}
+
+const LaserMapping::TrajectorySegment *LaserMapping::FindTrajectorySegment(double begin_time, double end_time) const {
+    constexpr double kTimeEps = 1e-4;
+    for (const auto &segment : trajectory_history_) {
+        if (begin_time >= segment.begin_time - kTimeEps && end_time <= segment.end_time + kTimeEps) {
+            return &segment;
+        }
+    }
+    return nullptr;
+}
+
+bool LaserMapping::HasTrajectoryFor(double begin_time, double end_time) const {
+    return FindTrajectorySegment(begin_time, end_time) != nullptr;
+}
+
+bool LaserMapping::EvaluateTrajectoryPose(const TrajectorySegment &segment, double timestamp, SE3 &pose) const {
+    if (segment.poses.empty()) {
+        return false;
+    }
+
+    constexpr double kTimeEps = 1e-6;
+    if (timestamp <= segment.poses.front().timestamp + kTimeEps) {
+        pose = SE3(segment.poses.front().rot, segment.poses.front().pos);
+        return true;
+    }
+    if (timestamp >= segment.poses.back().timestamp - kTimeEps) {
+        pose = SE3(segment.poses.back().rot, segment.poses.back().pos);
+        return true;
+    }
+
+    for (size_t i = 1; i < segment.poses.size(); ++i) {
+        const auto &prev = segment.poses[i - 1];
+        const auto &next = segment.poses[i];
+        if (timestamp > next.timestamp) {
+            continue;
+        }
+
+        const double ratio = (timestamp - prev.timestamp) / (next.timestamp - prev.timestamp);
+        const Vec3d pos = prev.pos + ratio * (next.pos - prev.pos);
+        const Eigen::Quaterniond q = prev.rot.unit_quaternion().slerp(ratio, next.rot.unit_quaternion());
+        pose = SE3(SO3(q), pos);
+        return true;
+    }
+
+    return false;
+}
+
+CloudPtr LaserMapping::DeskewMapCloud(const CloudPtr &cloud, double cloud_header_time, double reference_time) const {
+    if (!cloud || cloud->empty()) {
+        return nullptr;
+    }
+
+    double begin_time = std::numeric_limits<double>::max();
+    double end_time = std::numeric_limits<double>::lowest();
+    for (const auto &pt : cloud->points) {
+        const double point_time = cloud_header_time + pt.time / 1000.0;
+        begin_time = std::min(begin_time, point_time);
+        end_time = std::max(end_time, point_time);
+    }
+
+    const double query_begin = std::min(begin_time, reference_time);
+    const double query_end = std::max(end_time, reference_time);
+    const auto *segment = FindTrajectorySegment(query_begin, query_end);
+    if (segment == nullptr) {
+        return nullptr;
+    }
+
+    SE3 ref_pose;
+    if (!EvaluateTrajectoryPose(*segment, reference_time, ref_pose)) {
+        return nullptr;
+    }
+    const SE3 ref_pose_inv = ref_pose.inverse();
+
+    CloudPtr deskewed(new PointCloudType());
+    deskewed->reserve(cloud->size());
+    deskewed->header = cloud->header;
+    deskewed->is_dense = cloud->is_dense;
+
+    for (const auto &pt : cloud->points) {
+        const double point_time = cloud_header_time + pt.time / 1000.0;
+        SE3 point_pose;
+        if (!EvaluateTrajectoryPose(*segment, point_time, point_pose)) {
+            return nullptr;
+        }
+
+        const Vec3d point_lidar(pt.x, pt.y, pt.z);
+        const Vec3d point_imu = offset_R_lidar_fixed_ * point_lidar + offset_t_lidar_fixed_;
+        const Vec3d point_ref_imu = ref_pose_inv * (point_pose * point_imu);
+        const Vec3d point_ref_lidar = offset_R_lidar_fixed_.transpose() * (point_ref_imu - offset_t_lidar_fixed_);
+
+        PointType out = pt;
+        out.x = point_ref_lidar.x();
+        out.y = point_ref_lidar.y();
+        out.z = point_ref_lidar.z();
+        deskewed->points.push_back(out);
+    }
+
+    deskewed->width = deskewed->points.size();
+    deskewed->height = 1;
+    return deskewed;
+}
+
+void LaserMapping::RecordTrajectorySegment() {
+    if (!split_pipeline_enabled_) {
+        return;
+    }
+
+    TrajectorySegment segment;
+    segment.begin_time = measures_.lidar_begin_time_;
+    segment.end_time = measures_.lidar_end_time_;
+    segment.poses.reserve(p_imu_->GetLastImuPose().size() + 1);
+
+    constexpr double kTimeEps = 1e-6;
+    for (const auto &pose : p_imu_->GetLastImuPose()) {
+        const double timestamp = segment.begin_time + pose.offset_time;
+        if (timestamp < segment.begin_time - kTimeEps || timestamp > segment.end_time + kTimeEps) {
+            continue;
+        }
+        if (!segment.poses.empty() && timestamp <= segment.poses.back().timestamp + kTimeEps) {
+            continue;
+        }
+
+        TrajectoryPose sample;
+        sample.timestamp = timestamp;
+        sample.pos = pose.pos;
+        sample.rot = SO3(pose.rot);
+        segment.poses.push_back(sample);
+    }
+
+    const NavState &end_state = p_imu_->GetLastLidarEndStateBeforeUpdate();
+    TrajectoryPose end_sample;
+    end_sample.timestamp = segment.end_time;
+    end_sample.pos = end_state.pos_;
+    end_sample.rot = end_state.rot_;
+    if (segment.poses.empty() || end_sample.timestamp > segment.poses.back().timestamp + kTimeEps) {
+        segment.poses.push_back(end_sample);
+    } else {
+        segment.poses.back() = end_sample;
+    }
+
+    if (segment.poses.size() < 2) {
+        return;
+    }
+
+    trajectory_history_.push_back(segment);
+    const double cutoff_time = segment.end_time - trajectory_buffer_s_;
+    while (!trajectory_history_.empty() && trajectory_history_.front().end_time < cutoff_time) {
+        trajectory_history_.pop_front();
+    }
+}
+
 void LaserMapping::ProcessIMU(const lightning::IMUPtr &imu) {
     publish_count_++;
 
@@ -269,6 +432,7 @@ bool LaserMapping::Run() {
 
         first_lidar_time_ = measures_.lidar_end_time_;
         state_point_.timestamp_ = lidar_end_time_;
+        RecordTrajectorySegment();
         flg_first_scan_ = false;
         return true;
     }
@@ -354,6 +518,7 @@ bool LaserMapping::Run() {
 
     state_point_ = kf_.GetX();
     state_point_.timestamp_ = measures_.lidar_end_time_;
+    RecordTrajectorySegment();
 
     const double delta_translation = (pred_state.pos_ - state_point_.pos_).norm();
     const double delta_rotation_deg = (pred_state.rot_.inverse() * state_point_.rot_).log().norm() * 180.0 / M_PI;

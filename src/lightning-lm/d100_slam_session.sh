@@ -2,7 +2,7 @@
 # D100 实机 SLAM 一键启动 tmux session
 #
 # 用法:
-#   bash src/lightning-lm-deep-robotics/d100_slam_session.sh [config]
+#   bash src/lightning-lm/d100_slam_session.sh [config]
 #
 #   config: SLAM yaml 名（不含路径），可选
 #       d100_slam_back.yaml   建图（默认）
@@ -69,7 +69,7 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
     exit 1
 fi
 
-SLAM_CONFIG_PATH="src/lightning-lm-deep-robotics/config/$SLAM_CONFIG"
+SLAM_CONFIG_PATH="src/lightning-lm/config/$SLAM_CONFIG"
 if [[ ! -f "$ROS2_WS/$SLAM_CONFIG_PATH" ]]; then
     echo "WARN: $ROS2_WS/$SLAM_CONFIG_PATH not found. Lightning-LM will fail to start."
     echo "     check filename or set SLAM_CONFIG arg."
