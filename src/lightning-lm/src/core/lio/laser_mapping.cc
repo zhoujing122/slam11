@@ -287,18 +287,66 @@ CloudPtr LaserMapping::DeskewMapCloud(const CloudPtr &cloud, double cloud_header
     const double query_begin = std::min(begin_time, reference_time);
     const double query_end = std::max(end_time, reference_time);
 
-    TrajectorySegment segment;
+    std::vector<TrajectorySegment> segments;
+    constexpr double kTimeEps = 1e-4;
     {
         std::lock_guard<std::mutex> lock(trajectory_mutex_);
-        const auto *history_segment = FindTrajectorySegmentUnlocked(query_begin, query_end);
-        if (history_segment == nullptr) {
-            return nullptr;
+        for (const auto &history_segment : trajectory_history_) {
+            if (history_segment.end_time + kTimeEps < query_begin) {
+                continue;
+            }
+            if (history_segment.begin_time - kTimeEps > query_end) {
+                break;
+            }
+            segments.push_back(history_segment);
         }
-        segment = *history_segment;
+    }
+    std::vector<TrajectoryPose> poses;
+    for (const auto &segment : segments) {
+        for (const auto &pose : segment.poses) {
+            if (!poses.empty() && pose.timestamp <= poses.back().timestamp + kTimeEps) {
+                continue;
+            }
+            poses.push_back(pose);
+        }
+    }
+    if (poses.empty() || query_begin < poses.front().timestamp - kTimeEps ||
+        query_end > poses.back().timestamp + kTimeEps) {
+        return nullptr;
     }
 
+    auto eval_pose = [&poses](double timestamp, SE3 &pose) {
+        constexpr double kEvalTimeEps = 1e-4;
+        if (timestamp <= poses.front().timestamp + kEvalTimeEps) {
+            pose = SE3(poses.front().rot, poses.front().pos);
+            return true;
+        }
+        if (timestamp >= poses.back().timestamp - kEvalTimeEps) {
+            pose = SE3(poses.back().rot, poses.back().pos);
+            return true;
+        }
+
+        for (size_t i = 1; i < poses.size(); ++i) {
+            const auto &prev = poses[i - 1];
+            const auto &next = poses[i];
+            if (timestamp > next.timestamp + kEvalTimeEps) {
+                continue;
+            }
+            const double dt = next.timestamp - prev.timestamp;
+            if (dt <= 0.0) {
+                return false;
+            }
+            const double ratio = std::clamp((timestamp - prev.timestamp) / dt, 0.0, 1.0);
+            const Vec3d pos = prev.pos + ratio * (next.pos - prev.pos);
+            const Eigen::Quaterniond q = prev.rot.unit_quaternion().slerp(ratio, next.rot.unit_quaternion());
+            pose = SE3(SO3(q), pos);
+            return true;
+        }
+        return false;
+    };
+
     SE3 ref_pose;
-    if (!EvaluateTrajectoryPose(segment, reference_time, ref_pose)) {
+    if (!eval_pose(reference_time, ref_pose)) {
         return nullptr;
     }
     const SE3 ref_pose_inv = ref_pose.inverse();
@@ -311,7 +359,7 @@ CloudPtr LaserMapping::DeskewMapCloud(const CloudPtr &cloud, double cloud_header
     for (const auto &pt : cloud->points) {
         const double point_time = cloud_header_time + pt.time / 1000.0;
         SE3 point_pose;
-        if (!EvaluateTrajectoryPose(segment, point_time, point_pose)) {
+        if (!eval_pose(point_time, point_pose)) {
             return nullptr;
         }
 
@@ -595,7 +643,8 @@ bool LaserMapping::Run() {
 
     LOG(INFO) << "LIO state: " << state_point_.pos_.transpose() << ", yaw "
               << state_point_.rot_.angleZ<double>() * 180 / M_PI << ", vel: " << state_point_.vel_.transpose()
-              << ", grav: " << state_point_.grav_.transpose() << ", grav norm: " << state_point_.grav_.norm();
+              << ", grav: " << state_point_.grav_.transpose() << ", grav norm: " << state_point_.grav_.norm()
+              << ", time: " << std::setprecision(14) << state_point_.timestamp_;
 
     return true;
 }
@@ -692,7 +741,24 @@ CloudPtr LaserMapping::BuildKeyframeCloud() {
 }
 
 CloudPtr LaserMapping::FilterMappingCloudBySource(const CloudPtr &cloud) const {
-    if (!cloud || cloud->empty() || keyframe_source_mode_ == "all") {
+    if (!cloud || cloud->empty()) {
+        return cloud;
+    }
+
+    std::array<int, kSourceCount> input_counts{};
+    int invalid_source_id = 0;
+    for (const auto &pt : cloud->points) {
+        const int source_idx = SourceIndex(pt.source_id, invalid_source_id);
+        if (source_idx >= 0) {
+            input_counts[source_idx]++;
+        }
+    }
+
+    if (keyframe_source_mode_ == "all") {
+        LOG(INFO) << "[split mapping source filter] mode=all input_total=" << cloud->points.size()
+                  << " input=(" << SourceCountsToString(input_counts) << ") output_total="
+                  << cloud->points.size() << " output=(" << SourceCountsToString(input_counts)
+                  << ") invalid_source_id=" << invalid_source_id;
         return cloud;
     }
 
@@ -701,17 +767,24 @@ CloudPtr LaserMapping::FilterMappingCloudBySource(const CloudPtr &cloud) const {
     filtered->header = cloud->header;
     filtered->is_dense = cloud->is_dense;
 
-    int invalid_source_id = 0;
+    std::array<int, kSourceCount> output_counts{};
     for (const auto &pt : cloud->points) {
-        const int source_idx = SourceIndex(pt.source_id, invalid_source_id);
+        int ignored_invalid = 0;
+        const int source_idx = SourceIndex(pt.source_id, ignored_invalid);
         if (source_idx >= 0 && IsAllowedKeyframeSource(source_idx, keyframe_source_mode_)) {
             filtered->points.push_back(pt);
+            output_counts[source_idx]++;
         }
     }
 
     filtered->width = filtered->points.size();
     filtered->height = 1;
 
+    LOG(INFO) << "[split mapping source filter] mode=" << keyframe_source_mode_
+              << " input_total=" << cloud->points.size() << " input=("
+              << SourceCountsToString(input_counts) << ") output_total=" << filtered->points.size()
+              << " output=(" << SourceCountsToString(output_counts)
+              << ") invalid_source_id=" << invalid_source_id;
     if (invalid_source_id > 0) {
         LOG(WARNING) << "split mapping source filter ignored invalid source_id points: " << invalid_source_id;
     }

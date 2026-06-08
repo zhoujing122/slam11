@@ -15,6 +15,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <yaml-cpp/yaml.h>
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -416,6 +417,12 @@ void SlamSystem::ProcessMappingLidar(const sensor_msgs::msg::PointCloud2::Shared
         return;
     }
 
+    if (!options_.online_mode_) {
+        ProcessRawMappingCloud(cloud_msg);
+        PublishReadyKeyframes(TryPublishPendingKeyframes(false));
+        return;
+    }
+
     {
         UL lock(mapping_mutex_);
         raw_mapping_clouds_.push_back(cloud_msg);
@@ -518,6 +525,28 @@ void SlamSystem::ProcessRawMappingCloud(const sensor_msgs::msg::PointCloud2::Sha
     {
         UL lock(mapping_mutex_);
         pending_map_clouds_.push_back(pending);
+
+        while (!pending_map_clouds_.empty()) {
+            bool drop_front = false;
+            if (!pending_keyframes_.empty()) {
+                const double stale_before = pending_keyframes_.front().reference_time - mapping_match_tolerance_s_;
+                drop_front = pending_map_clouds_.front().end_time < stale_before;
+                if (drop_front) {
+                    LOG(WARNING) << "split mapping drop stale map cloud, map_end="
+                                 << pending_map_clouds_.front().end_time
+                                 << ", kf_time=" << pending_keyframes_.front().reference_time;
+                    map_cloud_no_match_++;
+                }
+            } else {
+                const double keep_after = pending.end_time - max_sensor_time_gap_s_ - mapping_match_tolerance_s_;
+                drop_front = pending_map_clouds_.front().end_time < keep_after;
+            }
+            if (!drop_front) {
+                break;
+            }
+            pending_map_clouds_.pop_front();
+        }
+
         const size_t map_limit = std::max<size_t>(1, pending_keyframe_limit_ * 2);
         while (pending_map_clouds_.size() > map_limit) {
             pending_map_clouds_.pop_front();
@@ -610,8 +639,7 @@ std::vector<SlamSystem::ReadyKeyframe> SlamSystem::TryPublishPendingKeyframes(bo
 
             for (size_t i = 0; i < pending_map_clouds_.size(); ++i) {
                 const auto& candidate = pending_map_clouds_[i];
-                if (candidate.begin_time - mapping_match_tolerance_s_ <= front_kf.reference_time &&
-                    front_kf.reference_time <= candidate.end_time + mapping_match_tolerance_s_) {
+                if (std::abs(candidate.end_time - front_kf.reference_time) <= mapping_match_tolerance_s_) {
                     map_cloud = candidate;
                     map_index = i;
                     has_match = true;
@@ -621,7 +649,7 @@ std::vector<SlamSystem::ReadyKeyframe> SlamSystem::TryPublishPendingKeyframes(bo
 
             if (!has_match) {
                 const bool sensor_gap_expired = !pending_map_clouds_.empty() &&
-                    pending_map_clouds_.front().begin_time > front_kf.reference_time + max_sensor_time_gap_s_;
+                    pending_map_clouds_.back().end_time > front_kf.reference_time + max_sensor_time_gap_s_;
                 const double waited_s = std::chrono::duration<double>(now - front_kf.enqueue_time).count();
                 const bool wall_time_expired = waited_s > mapping_wait_timeout_s_;
 
