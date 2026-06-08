@@ -3,6 +3,7 @@
 
 #include <pcl/filters/voxel_grid.h>
 #include <condition_variable>
+#include <mutex>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <string>
 #include <thread>
@@ -92,6 +93,7 @@ class LaserMapping {
     void ConfigureSplitPipeline(bool enabled, double trajectory_buffer_s);
     CloudPtr PreprocessMapPointCloud2(const sensor_msgs::msg::PointCloud2::SharedPtr &msg);
     CloudPtr DeskewMapCloud(const CloudPtr &cloud, double cloud_header_time, double reference_time) const;
+    CloudPtr FilterMappingCloudBySource(const CloudPtr &cloud) const;
     bool HasTrajectoryFor(double begin_time, double end_time) const;
 
     void ProcessIMU(const lightning::IMUPtr &msg_in);
@@ -158,7 +160,7 @@ class LaserMapping {
     CloudPtr BuildKeyframeCloud();
     void LogCloudSourceStats(const std::string &tag, const CloudPtr &cloud);
     void RecordTrajectorySegment();
-    const TrajectorySegment *FindTrajectorySegment(double begin_time, double end_time) const;
+    const TrajectorySegment *FindTrajectorySegmentUnlocked(double begin_time, double end_time) const;
     bool EvaluateTrajectoryPose(const TrajectorySegment &segment, double timestamp, SE3 &pose) const;
 
     bool LoadParamsFromYAML(const std::string &yaml);
@@ -174,12 +176,14 @@ class LaserMapping {
 
     /// modules
     IVoxType::Options ivox_options_;
-    std::shared_ptr<IVoxType> ivox_ = nullptr;                    // localmap in ivox
-    std::shared_ptr<PointCloudPreprocess> preprocess_ = nullptr;  // point cloud preprocess
-    std::shared_ptr<ImuProcess> p_imu_ = nullptr;                 // imu process
+    std::shared_ptr<IVoxType> ivox_ = nullptr;                         // localmap in ivox
+    std::shared_ptr<PointCloudPreprocess> preprocess_ = nullptr;       // point cloud preprocess
+    std::shared_ptr<PointCloudPreprocess> map_preprocess_ = nullptr;   // delayed mapping cloud preprocess
+    std::shared_ptr<ImuProcess> p_imu_ = nullptr;                      // imu process
 
     bool split_pipeline_enabled_ = false;
     double trajectory_buffer_s_ = 3.0;
+    mutable std::mutex trajectory_mutex_;
     std::deque<TrajectorySegment> trajectory_history_;
 
     /// local map related

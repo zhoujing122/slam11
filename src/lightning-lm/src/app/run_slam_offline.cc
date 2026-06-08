@@ -92,6 +92,7 @@ int main(int argc, char** argv) {
                              })
         .Go();
 
+    slam.FlushPendingMapping();
     slam.SaveMap("");
     Timer::PrintAll();
 

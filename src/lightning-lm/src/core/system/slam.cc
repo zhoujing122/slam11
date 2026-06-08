@@ -14,6 +14,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <yaml-cpp/yaml.h>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -62,8 +63,16 @@ bool SlamSystem::Init(const std::string& yaml_path) {
         if (yaml["split_pipeline"]["trajectory_buffer_s"]) {
             trajectory_buffer_s_ = yaml["split_pipeline"]["trajectory_buffer_s"].as<double>();
         }
-        if (yaml["split_pipeline"]["map_cloud_max_delay_s"]) {
-            map_cloud_max_delay_s_ = yaml["split_pipeline"]["map_cloud_max_delay_s"].as<double>();
+        if (yaml["split_pipeline"]["max_sensor_time_gap_s"]) {
+            max_sensor_time_gap_s_ = yaml["split_pipeline"]["max_sensor_time_gap_s"].as<double>();
+        } else if (yaml["split_pipeline"]["map_cloud_max_delay_s"]) {
+            max_sensor_time_gap_s_ = yaml["split_pipeline"]["map_cloud_max_delay_s"].as<double>();
+        }
+        if (yaml["split_pipeline"]["mapping_wait_timeout_s"]) {
+            mapping_wait_timeout_s_ = yaml["split_pipeline"]["mapping_wait_timeout_s"].as<double>();
+        }
+        if (yaml["split_pipeline"]["mapping_match_tolerance_s"]) {
+            mapping_match_tolerance_s_ = yaml["split_pipeline"]["mapping_match_tolerance_s"].as<double>();
         }
         if (yaml["split_pipeline"]["pending_keyframe_limit"]) {
             pending_keyframe_limit_ = yaml["split_pipeline"]["pending_keyframe_limit"].as<size_t>();
@@ -209,6 +218,10 @@ bool SlamSystem::Init(const std::string& yaml_path) {
 
         path_msg_.header.frame_id = "map";
 
+        if (split_pipeline_enabled_) {
+            StartMappingWorker();
+        }
+
         LOG(INFO) << "online slam node has been created.";
     }
 
@@ -216,6 +229,7 @@ bool SlamSystem::Init(const std::string& yaml_path) {
 }
 
 SlamSystem::~SlamSystem() {
+    StopMappingWorker();
     if (ui_) {
         ui_->Quit();
     }
@@ -402,6 +416,85 @@ void SlamSystem::ProcessMappingLidar(const sensor_msgs::msg::PointCloud2::Shared
         return;
     }
 
+    {
+        UL lock(mapping_mutex_);
+        raw_mapping_clouds_.push_back(cloud_msg);
+        const size_t raw_limit = std::max<size_t>(1, pending_keyframe_limit_ * 2);
+        while (raw_mapping_clouds_.size() > raw_limit) {
+            raw_mapping_clouds_.pop_front();
+            raw_mapping_cloud_overflow_++;
+            LOG(WARNING) << "split mapping raw cloud queue overflow, dropped oldest, total="
+                         << raw_mapping_cloud_overflow_;
+        }
+        mapping_work_requested_ = true;
+    }
+    mapping_cv_.notify_one();
+}
+
+void SlamSystem::StartMappingWorker() {
+    if (mapping_worker_.joinable()) {
+        return;
+    }
+    mapping_worker_stop_ = false;
+    mapping_worker_ = std::thread([this]() { MappingWorkerLoop(); });
+}
+
+void SlamSystem::StopMappingWorker() {
+    {
+        UL lock(mapping_mutex_);
+        mapping_worker_stop_ = true;
+        mapping_work_requested_ = true;
+    }
+    mapping_cv_.notify_all();
+    if (mapping_worker_.joinable()) {
+        mapping_worker_.join();
+    }
+}
+
+bool SlamSystem::PopRawMappingCloud(sensor_msgs::msg::PointCloud2::SharedPtr& cloud_msg) {
+    UL lock(mapping_mutex_);
+    if (raw_mapping_clouds_.empty()) {
+        return false;
+    }
+    cloud_msg = raw_mapping_clouds_.front();
+    raw_mapping_clouds_.pop_front();
+    return true;
+}
+
+void SlamSystem::MappingWorkerLoop() {
+    while (true) {
+        sensor_msgs::msg::PointCloud2::SharedPtr raw_cloud;
+        bool run_match = false;
+        {
+            UL lock(mapping_mutex_);
+            mapping_cv_.wait_for(lock, std::chrono::milliseconds(50), [this]() {
+                return mapping_worker_stop_ || !raw_mapping_clouds_.empty() || mapping_work_requested_;
+            });
+
+            if (mapping_worker_stop_ && raw_mapping_clouds_.empty()) {
+                break;
+            }
+
+            if (!raw_mapping_clouds_.empty()) {
+                raw_cloud = raw_mapping_clouds_.front();
+                raw_mapping_clouds_.pop_front();
+            }
+            run_match = mapping_work_requested_ || !pending_keyframes_.empty();
+            mapping_work_requested_ = false;
+        }
+
+        if (raw_cloud) {
+            ProcessRawMappingCloud(raw_cloud);
+            run_match = true;
+        }
+
+        if (run_match) {
+            PublishReadyKeyframes(TryPublishPendingKeyframes(false));
+        }
+    }
+}
+
+void SlamSystem::ProcessRawMappingCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& cloud_msg) {
     CloudPtr cloud = lio_->PreprocessMapPointCloud2(cloud_msg);
     if (!cloud || cloud->empty()) {
         return;
@@ -421,13 +514,18 @@ void SlamSystem::ProcessMappingLidar(const sensor_msgs::msg::PointCloud2::Shared
     pending.end_time = end_time;
     pending.header_time = header_time;
     pending.cloud = cloud;
-    pending_map_clouds_.push_back(pending);
 
-    while (pending_map_clouds_.size() > pending_keyframe_limit_ * 2) {
-        pending_map_clouds_.pop_front();
+    {
+        UL lock(mapping_mutex_);
+        pending_map_clouds_.push_back(pending);
+        const size_t map_limit = std::max<size_t>(1, pending_keyframe_limit_ * 2);
+        while (pending_map_clouds_.size() > map_limit) {
+            pending_map_clouds_.pop_front();
+            pending_map_cloud_overflow_++;
+            LOG(WARNING) << "split mapping map cloud queue overflow, dropped oldest, total="
+                         << pending_map_cloud_overflow_;
+        }
     }
-
-    TryPublishPendingKeyframes();
 }
 
 void SlamSystem::HandleReadyKeyframe(const Keyframe::Ptr& kf, const CloudPtr& scan_for_rviz) {
@@ -462,59 +560,155 @@ void SlamSystem::QueuePendingKeyframe(const Keyframe::Ptr& kf) {
         return;
     }
 
-    PendingKeyframe pending;
-    pending.kf = kf;
-    pending.reference_time = kf->GetState().timestamp_;
-    pending_keyframes_.push_back(pending);
+    {
+        UL lock(mapping_mutex_);
+        PendingKeyframe pending;
+        pending.kf = kf;
+        pending.reference_time = kf->GetState().timestamp_;
+        pending.enqueue_time = std::chrono::steady_clock::now();
+        pending_keyframes_.push_back(pending);
 
-    while (pending_keyframes_.size() > pending_keyframe_limit_) {
-        pending_keyframes_.pop_front();
+        while (pending_keyframes_.size() > pending_keyframe_limit_) {
+            pending_keyframes_.pop_front();
+            pending_keyframe_overflow_++;
+            LOG(WARNING) << "split mapping pending keyframe queue overflow, dropped oldest, total="
+                         << pending_keyframe_overflow_;
+        }
+        mapping_work_requested_ = true;
     }
-
-    TryPublishPendingKeyframes();
+    mapping_cv_.notify_one();
 }
 
-void SlamSystem::TryPublishPendingKeyframes() {
+std::vector<SlamSystem::ReadyKeyframe> SlamSystem::TryPublishPendingKeyframes(bool force_flush) {
+    std::vector<ReadyKeyframe> ready_keyframes;
+    if (!split_pipeline_enabled_) {
+        return ready_keyframes;
+    }
+
+    while (true) {
+        PendingKeyframe pending_kf;
+        PendingMapCloud map_cloud;
+        size_t map_index = 0;
+        bool has_match = false;
+        bool fallback_without_match = false;
+
+        {
+            UL lock(mapping_mutex_);
+            if (pending_keyframes_.empty()) {
+                break;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            const auto& front_kf = pending_keyframes_.front();
+            while (!pending_map_clouds_.empty() &&
+                   pending_map_clouds_.front().end_time + mapping_match_tolerance_s_ < front_kf.reference_time) {
+                LOG(WARNING) << "split mapping drop stale map cloud, map_end="
+                             << pending_map_clouds_.front().end_time << ", kf_time=" << front_kf.reference_time;
+                pending_map_clouds_.pop_front();
+                map_cloud_no_match_++;
+            }
+
+            for (size_t i = 0; i < pending_map_clouds_.size(); ++i) {
+                const auto& candidate = pending_map_clouds_[i];
+                if (candidate.begin_time - mapping_match_tolerance_s_ <= front_kf.reference_time &&
+                    front_kf.reference_time <= candidate.end_time + mapping_match_tolerance_s_) {
+                    map_cloud = candidate;
+                    map_index = i;
+                    has_match = true;
+                    break;
+                }
+            }
+
+            if (!has_match) {
+                const bool sensor_gap_expired = !pending_map_clouds_.empty() &&
+                    pending_map_clouds_.front().begin_time > front_kf.reference_time + max_sensor_time_gap_s_;
+                const double waited_s = std::chrono::duration<double>(now - front_kf.enqueue_time).count();
+                const bool wall_time_expired = waited_s > mapping_wait_timeout_s_;
+
+                if (force_flush || sensor_gap_expired || wall_time_expired) {
+                    pending_kf = front_kf;
+                    pending_keyframes_.pop_front();
+                    back_only_fallback_++;
+                    fallback_without_match = true;
+                    LOG(WARNING) << "split mapping keyframe fallback to back-only, kf_time="
+                                 << pending_kf.reference_time << ", force_flush=" << force_flush
+                                 << ", sensor_gap_expired=" << sensor_gap_expired
+                                 << ", wall_time_expired=" << wall_time_expired
+                                 << ", waited_s=" << waited_s
+                                 << ", total=" << back_only_fallback_;
+                } else {
+                    break;
+                }
+            } else {
+                pending_kf = front_kf;
+            }
+        }
+
+        if (fallback_without_match) {
+            ready_keyframes.emplace_back(pending_kf.kf, pending_kf.kf->GetCloud());
+            continue;
+        }
+
+        CloudPtr deskewed = lio_->DeskewMapCloud(map_cloud.cloud, map_cloud.header_time, pending_kf.reference_time);
+        CloudPtr keyframe_cloud = deskewed ? lio_->FilterMappingCloudBySource(deskewed) : nullptr;
+
+        {
+            UL lock(mapping_mutex_);
+            if (map_index < pending_map_clouds_.size()) {
+                pending_map_clouds_.erase(pending_map_clouds_.begin() + map_index);
+            }
+            if (!pending_keyframes_.empty()) {
+                pending_keyframes_.pop_front();
+            }
+        }
+
+        if (!keyframe_cloud || keyframe_cloud->empty()) {
+            deskew_no_trajectory_++;
+            back_only_fallback_++;
+            LOG(ERROR) << "split mapping deskew failed, fallback to back-only, kf_time="
+                       << pending_kf.reference_time << ", map_begin=" << map_cloud.begin_time
+                       << ", map_end=" << map_cloud.end_time
+                       << ", deskew_no_trajectory=" << deskew_no_trajectory_
+                       << ", back_only_fallback=" << back_only_fallback_;
+            ready_keyframes.emplace_back(pending_kf.kf, pending_kf.kf->GetCloud());
+            continue;
+        }
+
+        pending_kf.kf->SetCloud(keyframe_cloud);
+        ready_keyframes.emplace_back(pending_kf.kf, keyframe_cloud);
+    }
+
+    return ready_keyframes;
+}
+
+void SlamSystem::PublishReadyKeyframes(const std::vector<ReadyKeyframe>& ready_keyframes) {
+    for (const auto& ready : ready_keyframes) {
+        HandleReadyKeyframe(ready.first, ready.second);
+    }
+}
+
+void SlamSystem::FlushPendingMapping() {
     if (!split_pipeline_enabled_) {
         return;
     }
 
-    while (!pending_keyframes_.empty()) {
-        auto& pending_kf = pending_keyframes_.front();
-        while (!pending_map_clouds_.empty() && pending_map_clouds_.front().end_time < pending_kf.reference_time) {
-            pending_map_clouds_.pop_front();
-        }
-
-        auto match = pending_map_clouds_.end();
-        for (auto it = pending_map_clouds_.begin(); it != pending_map_clouds_.end(); ++it) {
-            if (it->begin_time <= pending_kf.reference_time && pending_kf.reference_time <= it->end_time) {
-                match = it;
-                break;
-            }
-        }
-
-        if (match == pending_map_clouds_.end()) {
-            if (!pending_map_clouds_.empty() &&
-                pending_map_clouds_.front().begin_time > pending_kf.reference_time + map_cloud_max_delay_s_) {
-                LOG(WARNING) << "drop split-pipeline keyframe without matching map cloud, kf_time="
-                             << pending_kf.reference_time << ", first_map_begin="
-                             << pending_map_clouds_.front().begin_time;
-                pending_keyframes_.pop_front();
-                continue;
-            }
-            break;
-        }
-
-        CloudPtr deskewed = lio_->DeskewMapCloud(match->cloud, match->header_time, pending_kf.reference_time);
-        if (!deskewed || deskewed->empty()) {
-            break;
-        }
-
-        pending_kf.kf->SetCloud(deskewed);
-        HandleReadyKeyframe(pending_kf.kf, deskewed);
-        pending_map_clouds_.erase(match);
-        pending_keyframes_.pop_front();
+    sensor_msgs::msg::PointCloud2::SharedPtr raw_cloud;
+    while (PopRawMappingCloud(raw_cloud)) {
+        ProcessRawMappingCloud(raw_cloud);
     }
+
+    PublishReadyKeyframes(TryPublishPendingKeyframes(true));
+
+    UL lock(mapping_mutex_);
+    LOG(INFO) << "split mapping flush: raw=" << raw_mapping_clouds_.size()
+              << ", map=" << pending_map_clouds_.size()
+              << ", keyframes=" << pending_keyframes_.size()
+              << ", raw_overflow=" << raw_mapping_cloud_overflow_
+              << ", map_overflow=" << pending_map_cloud_overflow_
+              << ", keyframe_overflow=" << pending_keyframe_overflow_
+              << ", stale_map=" << map_cloud_no_match_
+              << ", deskew_no_trajectory=" << deskew_no_trajectory_
+              << ", back_only_fallback=" << back_only_fallback_;
 }
 
 void SlamSystem::Spin() {

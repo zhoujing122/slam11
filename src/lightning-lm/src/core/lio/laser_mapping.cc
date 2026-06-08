@@ -102,10 +102,14 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         b_gyr_cov = yaml["fasterlio"]["b_gyr_cov"].as<float>();
         b_acc_cov = yaml["fasterlio"]["b_acc_cov"].as<float>();
         preprocess_->Blind() = yaml["fasterlio"]["blind"].as<double>();
+        map_preprocess_->Blind() = preprocess_->Blind();
         preprocess_->TimeScale() = yaml["fasterlio"]["time_scale"].as<double>();
+        map_preprocess_->TimeScale() = preprocess_->TimeScale();
         lidar_type = yaml["fasterlio"]["lidar_type"].as<int>();
         preprocess_->NumScans() = yaml["fasterlio"]["scan_line"].as<int>();
+        map_preprocess_->NumScans() = preprocess_->NumScans();
         preprocess_->PointFilterNum() = yaml["fasterlio"]["point_filter_num"].as<int>();
+        map_preprocess_->PointFilterNum() = preprocess_->PointFilterNum();
         if (yaml["fasterlio"]["lio_mode"]) {
             lio_mode_ = yaml["fasterlio"]["lio_mode"].as<std::string>();
         }
@@ -136,6 +140,7 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         float height_min = yaml["roi"]["height_min"].as<float>();
 
         preprocess_->SetHeightROI(height_max, height_min);
+        map_preprocess_->SetHeightROI(height_max, height_min);
 
         options_.kf_dis_th_ = yaml["fasterlio"]["kf_dis_th"].as<double>();
         options_.kf_angle_th_ = yaml["fasterlio"]["kf_angle_th"].as<double>() * M_PI / 180.0;
@@ -156,15 +161,19 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
               << ", keyframe_source_mode=" << keyframe_source_mode_;
     if (lidar_type == 1) {
         preprocess_->SetLidarType(LidarType::AVIA);
+        map_preprocess_->SetLidarType(LidarType::AVIA);
         LOG(INFO) << "Using AVIA Lidar";
     } else if (lidar_type == 2) {
         preprocess_->SetLidarType(LidarType::VELO32);
+        map_preprocess_->SetLidarType(LidarType::VELO32);
         LOG(INFO) << "Using Velodyne 32 Lidar";
     } else if (lidar_type == 3) {
         preprocess_->SetLidarType(LidarType::OUST64);
+        map_preprocess_->SetLidarType(LidarType::OUST64);
         LOG(INFO) << "Using OUST 64 Lidar";
     } else if (lidar_type == 4) {
         preprocess_->SetLidarType(LidarType::ROBOSENSE);
+        map_preprocess_->SetLidarType(LidarType::ROBOSENSE);
         LOG(INFO) << "Using RoboSense Lidar";
     } else {
         LOG(WARNING) << "unknown lidar_type";
@@ -199,6 +208,7 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
 
 LaserMapping::LaserMapping(Options options) : options_(options) {
     preprocess_.reset(new PointCloudPreprocess());
+    map_preprocess_.reset(new PointCloudPreprocess());
     p_imu_.reset(new ImuProcess());
 }
 
@@ -209,12 +219,12 @@ void LaserMapping::ConfigureSplitPipeline(bool enabled, double trajectory_buffer
 
 CloudPtr LaserMapping::PreprocessMapPointCloud2(const sensor_msgs::msg::PointCloud2::SharedPtr &msg) {
     CloudPtr cloud(new PointCloudType());
-    preprocess_->Process(msg, cloud);
+    map_preprocess_->Process(msg, cloud);
     pcl_conversions::toPCL(msg->header, cloud->header);
     return cloud;
 }
 
-const LaserMapping::TrajectorySegment *LaserMapping::FindTrajectorySegment(double begin_time, double end_time) const {
+const LaserMapping::TrajectorySegment *LaserMapping::FindTrajectorySegmentUnlocked(double begin_time, double end_time) const {
     constexpr double kTimeEps = 1e-4;
     for (const auto &segment : trajectory_history_) {
         if (begin_time >= segment.begin_time - kTimeEps && end_time <= segment.end_time + kTimeEps) {
@@ -225,7 +235,8 @@ const LaserMapping::TrajectorySegment *LaserMapping::FindTrajectorySegment(doubl
 }
 
 bool LaserMapping::HasTrajectoryFor(double begin_time, double end_time) const {
-    return FindTrajectorySegment(begin_time, end_time) != nullptr;
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    return FindTrajectorySegmentUnlocked(begin_time, end_time) != nullptr;
 }
 
 bool LaserMapping::EvaluateTrajectoryPose(const TrajectorySegment &segment, double timestamp, SE3 &pose) const {
@@ -275,13 +286,19 @@ CloudPtr LaserMapping::DeskewMapCloud(const CloudPtr &cloud, double cloud_header
 
     const double query_begin = std::min(begin_time, reference_time);
     const double query_end = std::max(end_time, reference_time);
-    const auto *segment = FindTrajectorySegment(query_begin, query_end);
-    if (segment == nullptr) {
-        return nullptr;
+
+    TrajectorySegment segment;
+    {
+        std::lock_guard<std::mutex> lock(trajectory_mutex_);
+        const auto *history_segment = FindTrajectorySegmentUnlocked(query_begin, query_end);
+        if (history_segment == nullptr) {
+            return nullptr;
+        }
+        segment = *history_segment;
     }
 
     SE3 ref_pose;
-    if (!EvaluateTrajectoryPose(*segment, reference_time, ref_pose)) {
+    if (!EvaluateTrajectoryPose(segment, reference_time, ref_pose)) {
         return nullptr;
     }
     const SE3 ref_pose_inv = ref_pose.inverse();
@@ -294,7 +311,7 @@ CloudPtr LaserMapping::DeskewMapCloud(const CloudPtr &cloud, double cloud_header
     for (const auto &pt : cloud->points) {
         const double point_time = cloud_header_time + pt.time / 1000.0;
         SE3 point_pose;
-        if (!EvaluateTrajectoryPose(*segment, point_time, point_pose)) {
+        if (!EvaluateTrajectoryPose(segment, point_time, point_pose)) {
             return nullptr;
         }
 
@@ -357,6 +374,7 @@ void LaserMapping::RecordTrajectorySegment() {
         return;
     }
 
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
     trajectory_history_.push_back(segment);
     const double cutoff_time = segment.end_time - trajectory_buffer_s_;
     while (!trajectory_history_.empty() && trajectory_history_.front().end_time < cutoff_time) {
@@ -671,6 +689,38 @@ CloudPtr LaserMapping::BuildKeyframeCloud() {
         return scan_undistort_;
     }
     return cloud;
+}
+
+CloudPtr LaserMapping::FilterMappingCloudBySource(const CloudPtr &cloud) const {
+    if (!cloud || cloud->empty() || keyframe_source_mode_ == "all") {
+        return cloud;
+    }
+
+    CloudPtr filtered(new PointCloudType());
+    filtered->reserve(cloud->size());
+    filtered->header = cloud->header;
+    filtered->is_dense = cloud->is_dense;
+
+    int invalid_source_id = 0;
+    for (const auto &pt : cloud->points) {
+        const int source_idx = SourceIndex(pt.source_id, invalid_source_id);
+        if (source_idx >= 0 && IsAllowedKeyframeSource(source_idx, keyframe_source_mode_)) {
+            filtered->points.push_back(pt);
+        }
+    }
+
+    filtered->width = filtered->points.size();
+    filtered->height = 1;
+
+    if (invalid_source_id > 0) {
+        LOG(WARNING) << "split mapping source filter ignored invalid source_id points: " << invalid_source_id;
+    }
+    if (filtered->empty()) {
+        LOG(WARNING) << "split mapping keyframe_source_mode=" << keyframe_source_mode_
+                     << " produced empty cloud; fallback to full deskewed map cloud";
+        return cloud;
+    }
+    return filtered;
 }
 
 void LaserMapping::LogCloudSourceStats(const std::string &tag, const CloudPtr &cloud) {

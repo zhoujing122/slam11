@@ -17,7 +17,9 @@ cloud_topics:
 split_pipeline:
   enabled: true
   trajectory_buffer_s: 3.0
-  map_cloud_max_delay_s: 1.5
+  max_sensor_time_gap_s: 1.5
+  mapping_wait_timeout_s: 1.5
+  mapping_match_tolerance_s: 0.005
   pending_keyframe_limit: 30
 
 fasterlio:

@@ -12,8 +12,14 @@
 #include <nav_msgs/msg/path.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include "lightning/msg/nav_state.hpp"
 #include "lightning/srv/save_map.hpp"
@@ -79,6 +85,8 @@ class SlamSystem {
     void ProcessLidar(const livox_ros_driver2::msg::CustomMsg::SharedPtr& cloud);
     void ProcessMappingLidar(const sensor_msgs::msg::PointCloud2::SharedPtr& cloud);
 
+    void FlushPendingMapping();
+
     /// 实时模式下的spin
     void Spin();
 
@@ -121,11 +129,20 @@ class SlamSystem {
     struct PendingKeyframe {
         Keyframe::Ptr kf = nullptr;
         double reference_time = 0.0;
+        std::chrono::steady_clock::time_point enqueue_time;
     };
+
+    using ReadyKeyframe = std::pair<Keyframe::Ptr, CloudPtr>;
 
     void HandleReadyKeyframe(const Keyframe::Ptr& kf, const CloudPtr& scan_for_rviz);
     void QueuePendingKeyframe(const Keyframe::Ptr& kf);
-    void TryPublishPendingKeyframes();
+    void StartMappingWorker();
+    void StopMappingWorker();
+    void MappingWorkerLoop();
+    void ProcessRawMappingCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& cloud_msg);
+    bool PopRawMappingCloud(sensor_msgs::msg::PointCloud2::SharedPtr& cloud_msg);
+    std::vector<ReadyKeyframe> TryPublishPendingKeyframes(bool force_flush);
+    void PublishReadyKeyframes(const std::vector<ReadyKeyframe>& ready_keyframes);
 
     /// 发布ROS2话题
     void PublishOdom(const NavState& state, double timestamp);
@@ -151,10 +168,25 @@ class SlamSystem {
 
     bool split_pipeline_enabled_ = false;
     double trajectory_buffer_s_ = 3.0;
-    double map_cloud_max_delay_s_ = 1.5;
+    double max_sensor_time_gap_s_ = 1.5;
+    double mapping_wait_timeout_s_ = 1.5;
+    double mapping_match_tolerance_s_ = 0.005;
     size_t pending_keyframe_limit_ = 30;
+    std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> raw_mapping_clouds_;
     std::deque<PendingMapCloud> pending_map_clouds_;
     std::deque<PendingKeyframe> pending_keyframes_;
+    std::mutex mapping_mutex_;
+    std::condition_variable mapping_cv_;
+    std::thread mapping_worker_;
+    bool mapping_worker_stop_ = false;
+    bool mapping_work_requested_ = false;
+
+    size_t raw_mapping_cloud_overflow_ = 0;
+    size_t pending_keyframe_overflow_ = 0;
+    size_t pending_map_cloud_overflow_ = 0;
+    size_t deskew_no_trajectory_ = 0;
+    size_t map_cloud_no_match_ = 0;
+    size_t back_only_fallback_ = 0;
 
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_ = nullptr;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_ = nullptr;
