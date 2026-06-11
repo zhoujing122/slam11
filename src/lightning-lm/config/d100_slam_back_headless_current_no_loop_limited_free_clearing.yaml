@@ -73,6 +73,8 @@ g2p5:
   grid_map_resolution: 0.1
   use_point_source_origin: true
   enable_free_clearing: true
+  free_clearing_max_range: 6.0
+  free_clearing_sources: [true, true, false]
   # source_id: 0=back (/LIDAR/POINTS), 1=chin (/chin/LIDAR/POINTS), 2=tail (/tail/LIDAR/POINTS)
   # Coordinates are in radar_uper_Link from the calibrated LiDAR TFs.
   source_origins:
@@ -81,14 +83,14 @@ g2p5:
     - [-0.7725, 0.000020892, -0.211138]
 
 system:
-  with_loop_closing: true
-  with_ui: true
+  with_loop_closing: false
+  with_ui: false
   with_2dui: false
   with_g2p5: true
   step_on_kf: false
 
   enable_lidar_loc_skip: false
-  enable_lidar_loc_rviz: true
+  enable_lidar_loc_rviz: false
   rviz_current_scan_topic: "/current_scan_cloud"
   rviz_global_map_topic: "/global_map_cloud"
   enable_lidar_odom_skip: false

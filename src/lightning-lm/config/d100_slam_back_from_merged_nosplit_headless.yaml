@@ -11,11 +11,11 @@ common:
   imu_topic: "/imu/data"
 
 cloud_topics:
-  lio_cloud_topic: "/LIDAR/POINTS"
+  lio_cloud_topic: "/merged/LIDAR/POINTS"
   mapping_cloud_topic: "/merged/LIDAR/POINTS"
 
 split_pipeline:
-  enabled: true
+  enabled: false
   trajectory_buffer_s: 3.0
   max_sensor_time_gap_s: 1.5
   mapping_wait_timeout_s: 1.5
@@ -82,13 +82,13 @@ g2p5:
 
 system:
   with_loop_closing: true
-  with_ui: true
+  with_ui: false
   with_2dui: false
   with_g2p5: true
   step_on_kf: false
 
   enable_lidar_loc_skip: false
-  enable_lidar_loc_rviz: true
+  enable_lidar_loc_rviz: false
   rviz_current_scan_topic: "/current_scan_cloud"
   rviz_global_map_topic: "/global_map_cloud"
   enable_lidar_odom_skip: false

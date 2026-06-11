@@ -46,9 +46,12 @@ class G2P5 {
     struct Options {
         Options() {}
 
-        bool online_mode_ = true;  // 是否为在线模式
+        bool online_mode_ = true;                // 是否为在线模式
         bool esti_floor_ = false;                // 是否需要估计地面
         bool use_point_source_origin_ = false;   // 是否按 source_id 使用多雷达原点
+        bool enable_free_clearing_ = true;       // 是否沿射线清除 free 区域
+        double free_clearing_max_range_ = 8.0;   // free clearing 的最大射线距离
+        std::array<bool, 3> free_clearing_sources_{true, true, false};
 
         double lidar_height_ = 0.0;  // 雷达的安装高度
         std::array<Vec3d, 3> source_origins_{Vec3d::Zero(), Vec3d::Zero(), Vec3d::Zero()};
@@ -116,7 +119,7 @@ class G2P5 {
     bool DetectPlaneCoeffs(Keyframe::Ptr kf);
 
     void SetWhitePoints(const std::vector<Vec2d> &ang_distance_height, Keyframe::Ptr kf, G2P5MapPtr &map,
-                        const Vec3d &sensor_origin, double lidar_height);
+                        const Vec3d &sensor_origin, double lidar_height, double max_range);
 
     Options options_;
 

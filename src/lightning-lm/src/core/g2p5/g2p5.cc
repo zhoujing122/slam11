@@ -436,13 +436,15 @@ void G2P5::Convert3DTo2DScan(Keyframe::Ptr kf, G2P5MapPtr &map) {
         // negative when the configured floor is below the back LiDAR frame.
         const double lidar_height = floor_coeffs_.head<3>().dot(sensor_origin) + floor_coeffs_[3];
 
-        // 以2D scan方式添加白色点
-        SetWhitePoints(angle_distance_height, kf, map, sensor_origin, lidar_height);
+        if (options_.enable_free_clearing_ && options_.free_clearing_sources_[source_idx]) {
+            // 以2D scan方式添加白色点
+            SetWhitePoints(angle_distance_height, kf, map, sensor_origin, lidar_height, options_.free_clearing_max_range_);
+        }
     }
 }
 
 void G2P5::SetWhitePoints(const std::vector<Vec2d> &pt2d, Keyframe::Ptr kf, G2P5MapPtr &map,
-                         const Vec3d &sensor_origin, double lidar_height) {
+                         const Vec3d &sensor_origin, double lidar_height, double max_range) {
     assert(pt2d.size() == 360);
 
     SE3 pose = kf->GetOptPose();
@@ -463,27 +465,24 @@ void G2P5::SetWhitePoints(const std::vector<Vec2d> &pt2d, Keyframe::Ptr kf, G2P5
             continue;
         }
 
-        const double local_x = sensor_origin.x() + r * cos(angle);
-        const double local_y = sensor_origin.y() + r * sin(angle);
+        const double clear_r = std::min<double>(r, max_range);
+        if (clear_r <= 0.0 || clear_r > options_.usable_scan_range_) {
+            continue;
+        }
+        const double clear_h = lidar_height + (h - lidar_height) * (clear_r / r);
+
+        const double local_x = sensor_origin.x() + clear_r * cos(angle);
+        const double local_y = sensor_origin.y() + clear_r * sin(angle);
         const double nz = floor_coeffs_[2];
         const double local_z = std::abs(nz) > 1e-6
-                                 ? (h - floor_coeffs_[3] - floor_coeffs_[0] * local_x -
+                                 ? (clear_h - floor_coeffs_[3] - floor_coeffs_[0] * local_x -
                                     floor_coeffs_[1] * local_y) /
                                        nz
-                                 : sensor_origin.z() + h;
+                                 : sensor_origin.z() + clear_h;
         Vec3d p_local(local_x, local_y, local_z);
         Vec3d p_world = pose * p_local;
 
-        /// 过近或超出有效距离时不按正常射线处理；近距离保留局部清除语义。
-        if (r == 0 || r > options_.usable_scan_range_) {
-            /// 比较近时，涂白
-            if (r >= 0 && r < 0.1) {
-                map->SetMissPoint(p_world[0], p_world[1], orig[0], orig[1], h, lidar_height);
-            }
-            continue;
-        }
-
-        map->SetMissPoint(p_world[0], p_world[1], orig[0], orig[1], h, lidar_height);
+        map->SetMissPoint(p_world[0], p_world[1], orig[0], orig[1], clear_h, lidar_height);
     }
 }
 
@@ -548,6 +547,26 @@ void G2P5::Init(std::string yaml_path) {
     if (yaml["g2p5"]["use_point_source_origin"]) {
         options_.use_point_source_origin_ = yaml["g2p5"]["use_point_source_origin"].as<bool>();
     }
+    if (yaml["g2p5"]["enable_free_clearing"]) {
+        options_.enable_free_clearing_ = yaml["g2p5"]["enable_free_clearing"].as<bool>();
+    }
+    if (yaml["g2p5"]["free_clearing_max_range"]) {
+        options_.free_clearing_max_range_ = yaml["g2p5"]["free_clearing_max_range"].as<double>();
+    }
+    if (yaml["g2p5"]["free_clearing_sources"]) {
+        int idx = 0;
+        for (const auto &source_node : yaml["g2p5"]["free_clearing_sources"]) {
+            if (idx >= static_cast<int>(options_.free_clearing_sources_.size())) {
+                break;
+            }
+            options_.free_clearing_sources_[idx++] = source_node.as<bool>();
+        }
+    }
+    LOG(INFO) << "G2P5 free clearing: " << (options_.enable_free_clearing_ ? "enabled" : "disabled")
+              << ", max_range=" << options_.free_clearing_max_range_
+              << ", sources=(back=" << options_.free_clearing_sources_[0]
+              << ", chin=" << options_.free_clearing_sources_[1]
+              << ", tail=" << options_.free_clearing_sources_[2] << ")";
     if (yaml["g2p5"]["source_origins"]) {
         int idx = 0;
         for (const auto &origin_node : yaml["g2p5"]["source_origins"]) {
