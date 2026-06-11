@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze the initial static segment of a ROS 2 bag.
-
-This reads compressed rosbag2 bags through rosbag2_py and reports IMU
-statistics plus LiDAR/camera topic timing for the first N seconds.
-"""
+"""Analyze the initial static segment of a ROS 2 bag or one sqlite db3 file."""
 
 from __future__ import annotations
 
@@ -17,6 +13,11 @@ import numpy as np
 import rosbag2_py
 from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import Imu, PointCloud2
+
+
+DEFAULT_IMU_SCALE = {
+    "/chin/rslidar_imu_data": 9.80665,
+}
 
 
 def stamp_sec(msg) -> float:
@@ -58,30 +59,44 @@ def iter_bag_messages(bag_path: str):
         yield reader.read_next()
 
 
-def summarize_imu(name: str, rows: list[tuple[float, np.ndarray, np.ndarray]]) -> None:
+def parse_scale(items: list[str]) -> dict[str, float]:
+    scales = dict(DEFAULT_IMU_SCALE)
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"--imu-scale must be TOPIC=SCALE, got {item!r}")
+        topic, value = item.split("=", 1)
+        scales[topic] = float(value)
+    return scales
+
+
+def summarize_imu(name: str, rows: list[tuple[float, np.ndarray, np.ndarray]], scale: float) -> None:
     if not rows:
         print(f"\n{name}: no samples")
         return
     t = np.array([r[0] for r in rows], dtype=np.float64)
-    acc = np.array([r[1] for r in rows], dtype=np.float64)
+    raw_acc = np.array([r[1] for r in rows], dtype=np.float64)
+    acc = raw_acc * scale
     gyro = np.array([r[2] for r in rows], dtype=np.float64)
     acc_norm = np.linalg.norm(acc, axis=1)
     gyro_norm = np.linalg.norm(gyro, axis=1)
+    mean_raw_acc = raw_acc.mean(axis=0)
     mean_acc = acc.mean(axis=0)
     std_acc = acc.std(axis=0)
     mean_gyro = gyro.mean(axis=0)
     std_gyro = gyro.std(axis=0)
     lateral = math.hypot(float(mean_acc[0]), float(mean_acc[1]))
-    tilt_deg = math.degrees(math.asin(max(-1.0, min(1.0, lateral / 9.80665))))
+    tilt_deg = math.degrees(math.atan2(lateral, abs(float(mean_acc[2]))))
 
     print(f"\n{name}:")
     print(f"  samples: {len(rows)}, header span: {t[0]:.6f} -> {t[-1]:.6f} ({t[-1] - t[0]:.3f}s)")
-    print(f"  acc mean xyz:  [{mean_acc[0]: .6f}, {mean_acc[1]: .6f}, {mean_acc[2]: .6f}] m/s^2")
-    print(f"  acc std xyz:   [{std_acc[0]: .6f}, {std_acc[1]: .6f}, {std_acc[2]: .6f}] m/s^2")
+    print(f"  acc scale to m/s^2: {scale:.8g}")
+    print(f"  raw acc mean xyz: [{mean_raw_acc[0]: .6f}, {mean_raw_acc[1]: .6f}, {mean_raw_acc[2]: .6f}]")
+    print(f"  acc mean xyz:     [{mean_acc[0]: .6f}, {mean_acc[1]: .6f}, {mean_acc[2]: .6f}] m/s^2")
+    print(f"  acc std xyz:      [{std_acc[0]: .6f}, {std_acc[1]: .6f}, {std_acc[2]: .6f}] m/s^2")
     print(f"  acc norm mean/std: {acc_norm.mean():.6f} / {acc_norm.std():.6f} m/s^2")
-    print(f"  lateral gravity component: {lateral:.6f} m/s^2, implied tilt: {tilt_deg:.3f} deg")
-    print(f"  gyro mean xyz: [{mean_gyro[0]: .8f}, {mean_gyro[1]: .8f}, {mean_gyro[2]: .8f}] rad/s")
-    print(f"  gyro std xyz:  [{std_gyro[0]: .8f}, {std_gyro[1]: .8f}, {std_gyro[2]: .8f}] rad/s")
+    print(f"  lateral gravity component: {lateral:.6f} m/s^2, tilt atan2(xy, |z|): {tilt_deg:.3f} deg")
+    print(f"  gyro mean xyz:    [{mean_gyro[0]: .8f}, {mean_gyro[1]: .8f}, {mean_gyro[2]: .8f}] rad/s")
+    print(f"  gyro std xyz:     [{std_gyro[0]: .8f}, {std_gyro[1]: .8f}, {std_gyro[2]: .8f}] rad/s")
     print(f"  gyro norm mean/p95/max: {gyro_norm.mean():.8f} / {np.percentile(gyro_norm, 95):.8f} / {gyro_norm.max():.8f} rad/s")
 
 
@@ -89,7 +104,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("bag")
     parser.add_argument("--duration", type=float, default=30.0, help="seconds from first bag message")
-    parser.add_argument("--window", type=float, default=2.0, help="per-window stats in seconds")
+    parser.add_argument("--window", type=float, default=2.0, help="reserved for future windowed reports")
     parser.add_argument(
         "--imu-topic",
         action="append",
@@ -100,7 +115,14 @@ def main() -> None:
         action="append",
         default=["/LIDAR/POINTS", "/chin/LIDAR/POINTS"],
     )
+    parser.add_argument(
+        "--imu-scale",
+        action="append",
+        default=[],
+        help="per-topic acceleration scale to m/s^2, e.g. /chin/rslidar_imu_data=9.80665",
+    )
     args = parser.parse_args()
+    imu_scales = parse_scale(args.imu_scale)
 
     bag_is_db = Path(args.bag).suffix == ".db3"
     if bag_is_db:
@@ -171,7 +193,7 @@ def main() -> None:
             print(f"  {topic}: count={counts[topic]}")
 
     for topic in args.imu_topic:
-        summarize_imu(topic, imu_rows[topic])
+        summarize_imu(topic, imu_rows[topic], imu_scales.get(topic, 1.0))
 
     print("\nper-second gyro norm mean, first seconds:")
     for topic in args.imu_topic:
