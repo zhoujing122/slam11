@@ -12,6 +12,9 @@
 #include "core/graph/optimizer.h"
 #include "core/types/edge_se3.h"
 
+#include <array>
+#include <deque>
+
 namespace lightning {
 
 /**
@@ -42,6 +45,45 @@ class LoopClosing {
 
         bool with_height_ = true;
         double height_noise_ = 0.1;
+
+        struct SourceQualityOptions {
+            int min_points_ = 300;
+            double min_point_ratio_to_median_ = 0.40;
+            double min_coverage_ratio_to_median_ = 0.50;
+            double min_scan_span_s_ = 0.0;
+            double max_scan_span_s_ = 0.0;
+            double min_scan_span_ratio_to_median_ = 0.50;
+        };
+
+        struct QualityGateOptions {
+            bool enabled_ = false;
+            bool require_back_valid_ = true;
+            bool allow_back_only_loop_ = true;
+            int min_valid_sources_ = 1;
+
+            int min_total_points_ = 1000;
+            double min_point_ratio_to_median_ = 0.40;
+
+            int azimuth_bins_ = 72;
+            double min_union_coverage_ratio_ = 0.45;
+            double max_empty_sector_deg_ = 150.0;
+
+            int rolling_window_size_ = 30;
+            int warmup_keyframes_ = 10;
+
+            bool require_ndt_converged_ = true;
+            bool reject_nonfinite_score_ = true;
+            bool reject_nonfinite_transform_ = true;
+
+            double max_correction_translation_m_ = 4.0;
+            double max_correction_yaw_deg_ = 30.0;
+            double max_correction_roll_pitch_deg_ = 8.0;
+
+            double overlap_search_radius_m_ = 0.5;
+            double min_overlap_ratio_ = 0.25;
+
+            std::array<SourceQualityOptions, 3> sources_;
+        } quality_gate_;
     };
 
     LoopClosing(Options options = Options()) { options_ = options; }
@@ -70,6 +112,41 @@ class LoopClosing {
     /// 优化位姿；返回是否有至少一个回环约束被接受为inlier
     bool PoseOptimization();
 
+    struct SourceQuality {
+        size_t point_count = 0;
+        double point_ratio_to_median = 0.0;
+        double azimuth_coverage_ratio = 0.0;
+        double azimuth_coverage_deg = 0.0;
+        double coverage_ratio_to_median = 0.0;
+        double scan_time_span_s = 0.0;
+        double scan_span_ratio_to_median = 0.0;
+        double largest_empty_sector_deg = 360.0;
+        bool valid = false;
+        std::string reason;
+    };
+
+    struct LoopCloudQuality {
+        bool usable = false;
+        size_t point_count = 0;
+        double point_ratio_to_median = 0.0;
+        double union_azimuth_coverage_ratio = 0.0;
+        double union_azimuth_coverage_deg = 0.0;
+        double largest_empty_sector_deg = 360.0;
+        double merged_scan_time_span_s = 0.0;
+        int source_mask = 0;
+        std::array<SourceQuality, 3> source;
+        std::string reason;
+    };
+
+    LoopCloudQuality EvaluateLoopCloudQuality(const Keyframe::Ptr& kf) const;
+    void RememberLoopCloudQuality(const LoopCloudQuality& quality);
+    bool IsHistoryLoopUsable(const Keyframe::Ptr& kf) const;
+    int SourceMaskForKeyframe(const Keyframe::Ptr& kf) const;
+    CloudPtr FilterCloudBySourceMask(const CloudPtr& cloud, int source_mask) const;
+    bool ValidateCandidateCorrection(const Mat4f& initial, const Mat4f& final, const LoopCandidate& c) const;
+    bool ValidateCandidateOverlap(const CloudPtr& target, const CloudPtr& source, const Mat4f& source_pose,
+                                  const LoopCandidate& c) const;
+
     Options options_;
 
     Keyframe::Ptr last_kf_ = nullptr;
@@ -87,6 +164,9 @@ class LoopClosing {
 
     std::vector<std::shared_ptr<miao::VertexSE3>> kf_vert_;
     std::vector<std::shared_ptr<miao::EdgeSE3>> edge_loops_;
+
+    std::map<unsigned long, LoopCloudQuality> loop_quality_by_id_;
+    std::deque<LoopCloudQuality> rolling_loop_quality_;
 
     LoopClosedCallback loop_cb_;
 };

@@ -105,6 +105,47 @@ loop_closing:
   max_range: 30.0
   ndt_score_th: 1.0
   with_height: true
+  quality_gate:
+    enabled: true
+    require_back_valid: true
+    allow_back_only_loop: true
+    min_valid_sources: 1
+    min_total_points: 1000
+    min_point_ratio_to_median: 0.40
+    azimuth_bins: 72
+    min_union_coverage_ratio: 0.45
+    max_empty_sector_deg: 150.0
+    rolling_window_size: 30
+    warmup_keyframes: 10
+    require_ndt_converged: true
+    reject_nonfinite_score: true
+    reject_nonfinite_transform: true
+    max_correction_translation_m: 4.0
+    max_correction_yaw_deg: 30.0
+    max_correction_roll_pitch_deg: 8.0
+    overlap_search_radius_m: 0.5
+    min_overlap_ratio: 0.25
+    back:
+      min_points: 300
+      min_point_ratio_to_median: 0.40
+      min_coverage_ratio_to_median: 0.50
+      min_scan_span_s: 0.05
+      max_scan_span_s: 0.15
+      min_scan_span_ratio_to_median: 0.50
+    chin:
+      min_points: 300
+      min_point_ratio_to_median: 0.35
+      min_coverage_ratio_to_median: 0.40
+      min_scan_span_s: 0.0
+      max_scan_span_s: 0.0
+      min_scan_span_ratio_to_median: 0.50
+    tail:
+      min_points: 300
+      min_point_ratio_to_median: 0.35
+      min_coverage_ratio_to_median: 0.40
+      min_scan_span_s: 0.0
+      max_scan_span_s: 0.0
+      min_scan_span_ratio_to_median: 0.50
 
 lidar_loc:
   enable_dynamic_polygon: false
