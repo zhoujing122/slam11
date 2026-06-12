@@ -87,8 +87,11 @@ void LoopClosing::HandleKF(Keyframe::Ptr kf) {
     // 计算回环位姿
     ComputeLoopCandidates();
 
-    // 位姿图优化
-    PoseOptimization();
+    // 每个关键帧都加入位姿图；只有验证并优化接受的回环才触发冷却和回调。
+    const bool loop_accepted = PoseOptimization();
+    if (loop_accepted) {
+        last_loop_kf_ = cur_kf_;
+    }
 
     last_kf_ = kf;
 }
@@ -131,10 +134,6 @@ void LoopClosing::DetectLoopCandidates() {
             candidates_.emplace_back(c);
             check_first = kf;
         }
-    }
-
-    if (!candidates_.empty()) {
-        last_loop_kf_ = cur_kf_;
     }
 
     if (options_.verbose_ && !candidates_.empty()) {
@@ -250,7 +249,7 @@ void LoopClosing::ComputeForCandidate(lightning::LoopCandidate& c) {
     //     "./data/lc_" + std::to_string(c.idx1_) + "_" + std::to_string(c.idx2_) + "_tgt.pcd", *rough_map1);
 }
 
-void LoopClosing::PoseOptimization() {
+bool LoopClosing::PoseOptimization() {
     auto v = std::make_shared<miao::VertexSE3>();
     v->SetId(cur_kf_->GetID());
     v->SetEstimate(cur_kf_->GetOptPose());
@@ -263,14 +262,23 @@ void LoopClosing::PoseOptimization() {
         int id = cur_kf_->GetID() - i;
         if (id >= 0) {
             auto last_kf = all_keyframes_[id];
+            auto last_v = optimizer_->GetVertex(last_kf->GetID());
+            if (!last_v) {
+                LOG(WARNING) << "skip motion edge with missing vertex: " << last_kf->GetID() << " -> "
+                             << cur_kf_->GetID();
+                continue;
+            }
+
             auto e = std::make_shared<miao::EdgeSE3>();
-            e->SetVertex(0, optimizer_->GetVertex(last_kf->GetID()));
+            e->SetVertex(0, last_v);
             e->SetVertex(1, v);
 
             SE3 motion = last_kf->GetLIOPose().inverse() * cur_kf_->GetLIOPose();
             e->SetMeasurement(motion);
             e->SetInformation(info_motion_);
-            optimizer_->AddEdge(e);
+            if (!optimizer_->AddEdge(e)) {
+                LOG(WARNING) << "failed to add motion edge: " << last_kf->GetID() << " -> " << cur_kf_->GetID();
+            }
         }
     }
 
@@ -284,10 +292,18 @@ void LoopClosing::PoseOptimization() {
     }
 
     /// 回环的约束
+    std::vector<std::shared_ptr<miao::EdgeSE3>> current_loop_edges;
     for (auto& c : candidates_) {
+        auto v1 = optimizer_->GetVertex(c.idx1_);
+        auto v2 = optimizer_->GetVertex(c.idx2_);
+        if (!v1 || !v2) {
+            LOG(WARNING) << "skip loop edge with missing vertex: " << c.idx1_ << " -> " << c.idx2_;
+            continue;
+        }
+
         auto e = std::make_shared<miao::EdgeSE3>();
-        e->SetVertex(0, optimizer_->GetVertex(c.idx1_));
-        e->SetVertex(1, optimizer_->GetVertex(c.idx2_));
+        e->SetVertex(0, v1);
+        e->SetVertex(1, v2);
         e->SetMeasurement(c.Tij_);
         e->SetInformation(info_loops_);
 
@@ -295,16 +311,20 @@ void LoopClosing::PoseOptimization() {
         rk->SetDelta(options_.rk_loop_th_);
         e->SetRobustKernel(rk);
 
-        optimizer_->AddEdge(e);
-        edge_loops_.emplace_back(e);
+        if (optimizer_->AddEdge(e)) {
+            edge_loops_.emplace_back(e);
+            current_loop_edges.emplace_back(e);
+        } else {
+            LOG(WARNING) << "failed to add loop edge: " << c.idx1_ << " -> " << c.idx2_;
+        }
     }
 
     if (optimizer_->GetEdges().empty()) {
-        return;
+        return false;
     }
 
-    if (candidates_.empty()) {
-        return;
+    if (current_loop_edges.empty()) {
+        return false;
     }
 
     optimizer_->InitializeOptimization();
@@ -314,7 +334,7 @@ void LoopClosing::PoseOptimization() {
 
     /// remove outliers
     int cnt_outliers = 0;
-    for (auto& e : edge_loops_) {
+    for (auto& e : current_loop_edges) {
         if (e->GetRobustKernel() == nullptr) {
             continue;
         }
@@ -328,7 +348,7 @@ void LoopClosing::PoseOptimization() {
     }
 
     if (options_.verbose_) {
-        LOG(INFO) << "loop outliers: " << cnt_outliers << "/" << edge_loops_.size();
+        LOG(INFO) << "loop outliers: " << cnt_outliers << "/" << current_loop_edges.size();
     }
 
     if (cnt_outliers > 0) {
@@ -336,17 +356,23 @@ void LoopClosing::PoseOptimization() {
         optimizer_->Optimize(10);
     }
 
+    const int cnt_inliers = static_cast<int>(current_loop_edges.size()) - cnt_outliers;
+    const bool loop_accepted = cnt_inliers > 0;
+
     /// get results
     for (auto& vert : kf_vert_) {
         SE3 pose = vert->Estimate();
         all_keyframes_[vert->GetId()]->SetOptPose(pose);
     }
 
-    if (loop_cb_) {
+    if (loop_accepted && loop_cb_) {
         loop_cb_();
     }
 
-    LOG(INFO) << "optimize finished, loops: " << edge_loops_.size();
+    LOG(INFO) << "optimize finished, loops: " << edge_loops_.size()
+              << ", current_inliers: " << cnt_inliers << "/" << current_loop_edges.size();
+
+    return loop_accepted;
 
     // LOG(INFO) << "lc: cur kf " << cur_kf_->GetID() << ", opt: " << cur_kf_->GetOptPose().translation().transpose()
     //           << ", lio: " << cur_kf_->GetLIOPose().translation().transpose();

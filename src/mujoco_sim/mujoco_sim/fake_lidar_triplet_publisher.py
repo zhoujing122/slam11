@@ -53,7 +53,7 @@ class FakeLidarTripletPublisher(Node):
 	                -0.258107,
 	                -3.1416,
 	                -0.69813,
-	                -3.1416,
+	                3.1416,
 	            ),
             _make_transform(
                 stamp,
@@ -64,7 +64,7 @@ class FakeLidarTripletPublisher(Node):
 	                -0.2111381,
 	                -3.1416,
 	                1.3788,
-	                3.1416,
+	                0.0,
 	            ),
         ]
         self.tf_broadcaster.sendTransform(transforms)

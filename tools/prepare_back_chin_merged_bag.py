@@ -212,7 +212,7 @@ def main() -> int:
     parser.add_argument("--wait-s", type=float, default=0.12)
     parser.add_argument("--max-dt-s", type=float, default=0.16)
     parser.add_argument("--translation", nargs=3, type=float, default=(0.34353, 0.000159742, -0.258107))
-    parser.add_argument("--rpy", nargs=3, type=float, default=(-3.1416, -0.69813, -3.1416), help="radar_f_Link to radar_uper_Link roll pitch yaw in radians")
+    parser.add_argument("--rpy", nargs=3, type=float, default=(-3.1416, -0.69813, 3.1416), help="radar_f_Link to radar_uper_Link roll pitch yaw in radians")
     args = parser.parse_args()
 
     output = Path(args.output)

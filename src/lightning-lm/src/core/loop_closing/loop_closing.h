@@ -67,8 +67,8 @@ class LoopClosing {
     /// 计算单个回环候选
     void ComputeForCandidate(LoopCandidate& c);
 
-    /// 优化位姿
-    void PoseOptimization();
+    /// 优化位姿；返回是否有至少一个回环约束被接受为inlier
+    bool PoseOptimization();
 
     Options options_;
 
