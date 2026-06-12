@@ -127,7 +127,8 @@ class LoopClosing {
 
     struct LoopCloudQuality {
         bool usable = false;
-        size_t point_count = 0;
+        size_t raw_point_count = 0;
+        size_t point_count = 0;  // valid source points used for loop query/NDT
         double point_ratio_to_median = 0.0;
         double union_azimuth_coverage_ratio = 0.0;
         double union_azimuth_coverage_deg = 0.0;

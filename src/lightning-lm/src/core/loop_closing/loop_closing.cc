@@ -229,14 +229,11 @@ LoopClosing::LoopCloudQuality LoopClosing::EvaluateLoopCloudQuality(const Keyfra
 
     const auto& qg = options_.quality_gate_;
     const int bins = std::max(1, qg.azimuth_bins_);
-    quality.point_count = cloud->size();
+    quality.raw_point_count = cloud->size();
 
     std::array<std::vector<bool>, kSourceCount> source_bins;
     std::array<double, kSourceCount> source_min_time;
     std::array<double, kSourceCount> source_max_time;
-    std::vector<bool> union_bins(bins, false);
-    double merged_min_time = std::numeric_limits<double>::infinity();
-    double merged_max_time = -std::numeric_limits<double>::infinity();
     for (int i = 0; i < kSourceCount; ++i) {
         source_bins[i].assign(bins, false);
         source_min_time[i] = std::numeric_limits<double>::infinity();
@@ -254,8 +251,6 @@ LoopClosing::LoopCloudQuality LoopClosing::EvaluateLoopCloudQuality(const Keyfra
         if (std::isfinite(pt.time)) {
             source_min_time[source_idx] = std::min(source_min_time[source_idx], pt.time);
             source_max_time[source_idx] = std::max(source_max_time[source_idx], pt.time);
-            merged_min_time = std::min(merged_min_time, pt.time);
-            merged_max_time = std::max(merged_max_time, pt.time);
         }
 
         const double yaw = std::atan2(static_cast<double>(pt.y), static_cast<double>(pt.x));
@@ -263,7 +258,6 @@ LoopClosing::LoopCloudQuality LoopClosing::EvaluateLoopCloudQuality(const Keyfra
         int bin = static_cast<int>(std::floor(yaw_norm / (2.0 * M_PI) * bins));
         bin = std::clamp(bin, 0, bins - 1);
         source_bins[source_idx][bin] = true;
-        union_bins[bin] = true;
     }
 
     auto fill_coverage = [bins](const std::vector<bool>& used, double& ratio, double& deg, double& largest_empty) {
@@ -287,23 +281,7 @@ LoopClosing::LoopCloudQuality LoopClosing::EvaluateLoopCloudQuality(const Keyfra
         largest_empty = 360.0 * static_cast<double>(max_run) / static_cast<double>(bins);
     };
 
-    fill_coverage(union_bins, quality.union_azimuth_coverage_ratio, quality.union_azimuth_coverage_deg,
-                  quality.largest_empty_sector_deg);
-    if (std::isfinite(merged_min_time) && std::isfinite(merged_max_time)) {
-        quality.merged_scan_time_span_s = NormalizeScanSpan(merged_max_time - merged_min_time);
-    }
-
     const bool use_median = static_cast<int>(rolling_loop_quality_.size()) >= qg.warmup_keyframes_;
-    std::vector<size_t> total_values;
-    for (const auto& item : rolling_loop_quality_) {
-        if (item.usable && item.point_count > 0) {
-            total_values.emplace_back(item.point_count);
-        }
-    }
-    const double total_median = use_median ? Median(total_values) : 0.0;
-    if (total_median > 0.0) {
-        quality.point_ratio_to_median = static_cast<double>(quality.point_count) / total_median;
-    }
 
     for (int source_idx = 0; source_idx < kSourceCount; ++source_idx) {
         auto& src = quality.source[source_idx];
@@ -376,6 +354,41 @@ LoopClosing::LoopCloudQuality LoopClosing::EvaluateLoopCloudQuality(const Keyfra
             quality.source_mask |= (1 << source_idx);
             src.reason = "ok";
         }
+    }
+
+    std::vector<bool> valid_union_bins(bins, false);
+    double valid_min_time = std::numeric_limits<double>::infinity();
+    double valid_max_time = -std::numeric_limits<double>::infinity();
+    quality.point_count = 0;
+    for (int source_idx = 0; source_idx < kSourceCount; ++source_idx) {
+        if ((quality.source_mask & (1 << source_idx)) == 0) {
+            continue;
+        }
+        quality.point_count += quality.source[source_idx].point_count;
+        for (int bin = 0; bin < bins; ++bin) {
+            valid_union_bins[bin] = valid_union_bins[bin] || source_bins[source_idx][bin];
+        }
+        if (std::isfinite(source_min_time[source_idx]) && std::isfinite(source_max_time[source_idx])) {
+            valid_min_time = std::min(valid_min_time, source_min_time[source_idx]);
+            valid_max_time = std::max(valid_max_time, source_max_time[source_idx]);
+        }
+    }
+
+    fill_coverage(valid_union_bins, quality.union_azimuth_coverage_ratio, quality.union_azimuth_coverage_deg,
+                  quality.largest_empty_sector_deg);
+    if (std::isfinite(valid_min_time) && std::isfinite(valid_max_time)) {
+        quality.merged_scan_time_span_s = NormalizeScanSpan(valid_max_time - valid_min_time);
+    }
+
+    std::vector<size_t> total_values;
+    for (const auto& item : rolling_loop_quality_) {
+        if (item.usable && item.point_count > 0) {
+            total_values.emplace_back(item.point_count);
+        }
+    }
+    const double total_median = use_median ? Median(total_values) : 0.0;
+    if (total_median > 0.0) {
+        quality.point_ratio_to_median = static_cast<double>(quality.point_count) / total_median;
     }
 
     const int valid_sources = __builtin_popcount(static_cast<unsigned>(quality.source_mask));
@@ -547,7 +560,8 @@ void LoopClosing::HandleKF(Keyframe::Ptr kf) {
 
     if (quality.usable) {
         LOG(INFO) << "loop query usable: kf=" << cur_kf_->GetID() << ", source_mask="
-                  << SourceMaskString(quality.source_mask) << ", total=" << quality.point_count << ", back="
+                  << SourceMaskString(quality.source_mask) << ", valid_total=" << quality.point_count
+                  << ", raw_total=" << quality.raw_point_count << ", back="
                   << quality.source[kBackSource].point_count << ", chin=" << quality.source[kChinSource].point_count
                   << ", tail=" << quality.source[kTailSource].point_count
                   << ", union_coverage=" << quality.union_azimuth_coverage_ratio;
@@ -560,7 +574,8 @@ void LoopClosing::HandleKF(Keyframe::Ptr kf) {
         ComputeLoopCandidates();
     } else {
         LOG(WARNING) << "skip loop query for low-quality keyframe: id=" << cur_kf_->GetID()
-                     << ", source_mask=" << SourceMaskString(quality.source_mask) << ", total=" << quality.point_count
+                     << ", source_mask=" << SourceMaskString(quality.source_mask)
+                     << ", valid_total=" << quality.point_count << ", raw_total=" << quality.raw_point_count
                      << ", back=" << quality.source[kBackSource].point_count
                      << "(" << quality.source[kBackSource].reason << ")"
                      << ", chin=" << quality.source[kChinSource].point_count
