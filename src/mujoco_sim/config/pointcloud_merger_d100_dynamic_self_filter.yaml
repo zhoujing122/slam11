@@ -1,0 +1,36 @@
+pointcloud_merger:
+  ros__parameters:
+    target_frame: radar_uper_Link
+    back_topic: /LIDAR/POINTS
+    chin_topic: /chin/LIDAR/POINTS
+    tail_topic: /tail/LIDAR/POINTS
+    output_topic: /merged/LIDAR/POINTS
+
+    # Back is the master scan. Side lidars are selected by per-point timestamp overlap.
+    sync_tolerance_s: 0.01
+    cache_size: 20
+    allow_back_only_fallback: true
+    side_wait_timeout_s: 1.0
+    max_pending_back_frames: 12
+
+    # LiDAR rigid extrinsics can be cached, but dynamic self-filter frames are always
+    # queried at each cloud stamp internally.
+    cache_static_tf: true
+    tf_lookup_timeout_s: 2.0
+
+    # RoboSense driver frame correction currently used by the D100 chin Airy path.
+    chin_driver_to_link_roll_deg: 0.0
+    chin_driver_to_link_pitch_deg: 0.0
+    chin_driver_to_link_yaw_deg: 180.0
+    tail_driver_to_link_roll_deg: 0.0
+    tail_driver_to_link_pitch_deg: 0.0
+    tail_driver_to_link_yaw_deg: 0.0
+
+    # Dynamic robot self filtering. Uses default D100 trunk/lidar/leg boxes unless
+    # dynamic_self_filter_shape_json points to a custom JSON with {boxes:[...]}.
+    dynamic_self_filter_enabled: true
+    dynamic_self_filter_padding_m: 0.03
+    dynamic_self_filter_shape_json: ""
+    dynamic_self_filter_require_all_shapes: false
+
+    stats_period_s: 5.0

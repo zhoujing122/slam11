@@ -32,6 +32,11 @@ from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Header
 import tf2_ros
 
+from mujoco_sim.dynamic_self_filter import (
+    CompositePointFilter,
+    load_shapes,
+    make_dynamic_self_filter,
+)
 from mujoco_sim.pointcloud_merger_core import (
     SourcePointFilter,
     merge_pointclouds,
@@ -116,6 +121,10 @@ class PointCloudMerger(Node):
         self.declare_parameter("back_exclude_max_y_m", 0.5)
         self.declare_parameter("back_exclude_min_z_m", -0.8)
         self.declare_parameter("back_exclude_max_z_m", 0.4)
+        self.declare_parameter("dynamic_self_filter_enabled", False)
+        self.declare_parameter("dynamic_self_filter_padding_m", 0.03)
+        self.declare_parameter("dynamic_self_filter_shape_json", "")
+        self.declare_parameter("dynamic_self_filter_require_all_shapes", False)
         # 0 disables periodic stats logging.
         self.declare_parameter("stats_period_s", 5.0)
 
@@ -161,6 +170,17 @@ class PointCloudMerger(Node):
             "radar_f_Link": self._point_filter_from_params("chin"),
             "radar_r_Link": self._point_filter_from_params("tail"),
         }
+        self.dynamic_self_filter_enabled = bool(
+            self.get_parameter("dynamic_self_filter_enabled").value
+        )
+        self.dynamic_self_filter_require_all_shapes = bool(
+            self.get_parameter("dynamic_self_filter_require_all_shapes").value
+        )
+        shape_json = str(self.get_parameter("dynamic_self_filter_shape_json").value)
+        self.dynamic_self_filter_shapes = load_shapes(
+            shape_json if shape_json else None,
+            float(self.get_parameter("dynamic_self_filter_padding_m").value),
+        )
         self.tf_lookup_timeout = Duration(
             seconds=float(self.get_parameter("tf_lookup_timeout_s").value)
         )
@@ -220,6 +240,7 @@ class PointCloudMerger(Node):
             "tail_driver_to_link_rpy=[%.2f, %.2f, %.2f]deg "
             "min_range=[back %.2f, chin %.2f, tail %.2f]m "
             "z_window=[back %.2f..%.2f, chin %.2f..%.2f, tail %.2f..%.2f]m "
+            "dynamic_self_filter=%s shapes=%d "
             "stats_period=%.1fs"
             % (
                 self.get_parameter("back_topic").value,
@@ -256,6 +277,8 @@ class PointCloudMerger(Node):
                 self.source_filters["radar_f_Link"].max_z or 999.0,
                 self.source_filters["radar_r_Link"].min_z or -999.0,
                 self.source_filters["radar_r_Link"].max_z or 999.0,
+                self.dynamic_self_filter_enabled,
+                len(self.dynamic_self_filter_shapes),
                 stats_period,
             )
         )
@@ -277,6 +300,7 @@ class PointCloudMerger(Node):
             "points_chin": 0,
             "points_tail": 0,
             "max_sync_delta_s": 0.0,  # worst |chin-back| or |tail-back| this window
+            "self_filter_removed": 0,
         }
 
     def _log_stats(self):
@@ -300,7 +324,7 @@ class PointCloudMerger(Node):
             "stats[%.1fs]: pub=%d (%.1fHz) drop=%d "
             "(no_sync=%d, pending_overflow=%d, tf=%d, merge=%d, fallback=%d) "
             "stalls=(chin=%d tail=%d) pts/frame=%d "
-            "(back=%d chin=%d tail=%d) max_sync_dt=%.1fms"
+            "(back=%d chin=%d tail=%d) self_filter_removed=%d max_sync_dt=%.1fms"
             % (
                 self._stats_period,
                 s["published"], rate_hz,
@@ -318,6 +342,7 @@ class PointCloudMerger(Node):
                 s["chin_stall_count"],
                 s["tail_stall_count"],
                 avg_pts, avg_back, avg_chin, avg_tail,
+                s["self_filter_removed"],
                 s["max_sync_delta_s"] * 1000.0,
             )
         )
@@ -477,7 +502,7 @@ class PointCloudMerger(Node):
                 transform[1],
                 self._extra_translation_for_source(cloud.header.frame_id),
                 self._extra_rotation_for_source(cloud.header.frame_id),
-                self._point_filter_for_source(cloud.header.frame_id),
+                self._point_filter_for_cloud(cloud, source_name),
                 self._source_id_for_source_name(source_name),
             ))
 
@@ -554,6 +579,39 @@ class PointCloudMerger(Node):
     def _point_filter_for_source(self, source_frame):
         return self.source_filters.get(source_frame, SourcePointFilter())
 
+    def _point_filter_for_cloud(self, cloud, source_name):
+        static_filter = self._point_filter_for_source(cloud.header.frame_id)
+        if not self.dynamic_self_filter_enabled:
+            return static_filter
+
+        def lookup_shape(shape_frame):
+            return self._lookup_self_filter_transform(shape_frame, cloud.header.stamp)
+
+        dynamic_filter = make_dynamic_self_filter(
+            self.dynamic_self_filter_shapes,
+            lookup_shape,
+            require_all_shapes=self.dynamic_self_filter_require_all_shapes,
+        )
+        if not dynamic_filter.active():
+            self.get_logger().warn(
+                "dynamic self-filter is enabled but no robot body boxes have TF into %s"
+                % self.target_frame,
+                throttle_duration_sec=2.0,
+            )
+
+        class StatsFilter:
+            def active(self_inner):
+                return dynamic_filter.active()
+
+            def keep_mask(self_inner, xyz):
+                keep = dynamic_filter.keep_mask(xyz)
+                removed = int(xyz.shape[0] - keep.sum())
+                if removed:
+                    self._stats["self_filter_removed"] += removed
+                return keep
+
+        return CompositePointFilter([static_filter, StatsFilter()])
+
     def _point_filter_from_params(self, source_name):
         min_range = _positive_or_none(
             self.get_parameter(f"{source_name}_min_range_m").value
@@ -590,6 +648,22 @@ class PointCloudMerger(Node):
             })
 
         return SourcePointFilter(**kwargs)
+
+    def _lookup_self_filter_transform(self, source_frame, cloud_stamp):
+        if source_frame == self.target_frame:
+            return IDENTITY_ROTATION, ZERO_TRANSLATION
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.target_frame,
+                source_frame,
+                cloud_stamp,
+                timeout=self.tf_lookup_timeout,
+            )
+        except Exception:
+            return None
+        translation = transform.transform.translation
+        rotation = _quaternion_to_matrix(transform.transform.rotation)
+        return rotation, (translation.x, translation.y, translation.z)
 
     def _lookup_transform(self, source_frame, cloud_stamp):
         """Resolve ``source_frame -> target_frame`` rotation+translation.

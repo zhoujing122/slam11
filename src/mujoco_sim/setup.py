@@ -23,6 +23,7 @@ data_files = [
     (os.path.join('share', package_name), ['package.xml']),
     # launch 文件
     (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
+    (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
 ] + collect_model_files()  # 添加 models 文件
 
 setup(
