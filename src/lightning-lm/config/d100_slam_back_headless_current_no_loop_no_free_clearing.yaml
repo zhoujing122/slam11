@@ -21,6 +21,8 @@ split_pipeline:
   mapping_wait_timeout_s: 1.5
   mapping_match_tolerance_s: 0.005
   pending_keyframe_limit: 30
+  missing_mapping_cloud_policy: drop
+  deskew_failure_policy: drop
 
 fasterlio:
   lidar_type: 4

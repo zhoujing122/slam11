@@ -9,7 +9,7 @@ pointcloud_merger:
     # Back is the master scan. Side lidars are selected by per-point timestamp overlap.
     side_match_tolerance_s: 0.01
     cache_size: 20
-    allow_back_only_fallback: true
+    allow_back_only_fallback: false
     side_wait_timeout_s: 1.0
     max_pending_back_frames: 12
 

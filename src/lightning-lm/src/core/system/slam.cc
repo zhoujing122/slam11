@@ -78,6 +78,23 @@ bool SlamSystem::Init(const std::string& yaml_path) {
         if (yaml["split_pipeline"]["pending_keyframe_limit"]) {
             pending_keyframe_limit_ = yaml["split_pipeline"]["pending_keyframe_limit"].as<size_t>();
         }
+        auto read_split_policy = [&](const std::string& key, bool& drop_flag) {
+            if (!yaml["split_pipeline"][key]) {
+                return;
+            }
+            const auto policy = yaml["split_pipeline"][key].as<std::string>();
+            if (policy == "drop") {
+                drop_flag = true;
+            } else if (policy == "back_only" || policy == "fallback") {
+                drop_flag = false;
+            } else {
+                LOG(WARNING) << "unknown split_pipeline." << key << "=" << policy
+                             << ", fallback to back_only";
+                drop_flag = false;
+            }
+        };
+        read_split_policy("missing_mapping_cloud_policy", drop_keyframe_without_mapping_cloud_);
+        read_split_policy("deskew_failure_policy", drop_keyframe_on_deskew_failure_);
     }
     lio_->ConfigureSplitPipeline(split_pipeline_enabled_, trajectory_buffer_s_);
 
@@ -623,9 +640,9 @@ std::vector<SlamSystem::ReadyKeyframe> SlamSystem::TryPublishPendingKeyframes(bo
     while (true) {
         PendingKeyframe pending_kf;
         PendingMapCloud map_cloud;
-        size_t map_index = 0;
         bool has_match = false;
         bool fallback_without_match = false;
+        bool drop_without_match = false;
 
         {
             UL lock(mapping_mutex_);
@@ -643,14 +660,14 @@ std::vector<SlamSystem::ReadyKeyframe> SlamSystem::TryPublishPendingKeyframes(bo
                 map_cloud_no_match_++;
             }
 
+            size_t best_index = 0;
             double best_delta = std::numeric_limits<double>::max();
             for (size_t i = 0; i < pending_map_clouds_.size(); ++i) {
                 const auto& candidate = pending_map_clouds_[i];
                 const double delta = std::abs(candidate.end_time - front_kf.reference_time);
                 if (delta <= mapping_match_tolerance_s_ && delta < best_delta) {
                     best_delta = delta;
-                    map_cloud = candidate;
-                    map_index = i;
+                    best_index = i;
                     has_match = true;
                 }
             }
@@ -664,20 +681,39 @@ std::vector<SlamSystem::ReadyKeyframe> SlamSystem::TryPublishPendingKeyframes(bo
                 if (force_flush || sensor_gap_expired || wall_time_expired) {
                     pending_kf = front_kf;
                     pending_keyframes_.pop_front();
-                    back_only_fallback_++;
-                    fallback_without_match = true;
-                    LOG(WARNING) << "split mapping keyframe fallback to back-only, kf_time="
-                                 << pending_kf.reference_time << ", force_flush=" << force_flush
-                                 << ", sensor_gap_expired=" << sensor_gap_expired
-                                 << ", wall_time_expired=" << wall_time_expired
-                                 << ", waited_s=" << waited_s
-                                 << ", total=" << back_only_fallback_;
+                    map_cloud_no_match_++;
+                    if (drop_keyframe_without_mapping_cloud_) {
+                        dropped_keyframe_without_mapping_cloud_++;
+                        drop_without_match = true;
+                        LOG(ERROR) << "split mapping drop keyframe without mapping cloud, kf_time="
+                                   << pending_kf.reference_time << ", force_flush=" << force_flush
+                                   << ", sensor_gap_expired=" << sensor_gap_expired
+                                   << ", wall_time_expired=" << wall_time_expired
+                                   << ", waited_s=" << waited_s
+                                   << ", total=" << dropped_keyframe_without_mapping_cloud_;
+                    } else {
+                        back_only_fallback_++;
+                        fallback_without_match = true;
+                        LOG(WARNING) << "split mapping keyframe fallback to back-only, kf_time="
+                                     << pending_kf.reference_time << ", force_flush=" << force_flush
+                                     << ", sensor_gap_expired=" << sensor_gap_expired
+                                     << ", wall_time_expired=" << wall_time_expired
+                                     << ", waited_s=" << waited_s
+                                     << ", total=" << back_only_fallback_;
+                    }
                 } else {
                     break;
                 }
             } else {
                 pending_kf = front_kf;
+                map_cloud = pending_map_clouds_[best_index];
+                pending_keyframes_.pop_front();
+                pending_map_clouds_.erase(pending_map_clouds_.begin() + best_index);
             }
+        }
+
+        if (drop_without_match) {
+            continue;
         }
 
         if (fallback_without_match) {
@@ -688,18 +724,18 @@ std::vector<SlamSystem::ReadyKeyframe> SlamSystem::TryPublishPendingKeyframes(bo
         CloudPtr deskewed = lio_->DeskewMapCloud(map_cloud.cloud, map_cloud.header_time, pending_kf.reference_time);
         CloudPtr keyframe_cloud = deskewed ? lio_->FilterMappingCloudBySource(deskewed) : nullptr;
 
-        {
-            UL lock(mapping_mutex_);
-            if (map_index < pending_map_clouds_.size()) {
-                pending_map_clouds_.erase(pending_map_clouds_.begin() + map_index);
-            }
-            if (!pending_keyframes_.empty()) {
-                pending_keyframes_.pop_front();
-            }
-        }
-
         if (!keyframe_cloud || keyframe_cloud->empty()) {
             deskew_no_trajectory_++;
+            if (drop_keyframe_on_deskew_failure_) {
+                dropped_keyframe_on_deskew_failure_++;
+                LOG(ERROR) << "split mapping drop keyframe after deskew failure, kf_time="
+                           << pending_kf.reference_time << ", map_begin=" << map_cloud.begin_time
+                           << ", map_end=" << map_cloud.end_time
+                           << ", deskew_no_trajectory=" << deskew_no_trajectory_
+                           << ", dropped_keyframe_on_deskew_failure=" << dropped_keyframe_on_deskew_failure_;
+                continue;
+            }
+
             back_only_fallback_++;
             LOG(ERROR) << "split mapping deskew failed, fallback to back-only, kf_time="
                        << pending_kf.reference_time << ", map_begin=" << map_cloud.begin_time
@@ -744,7 +780,9 @@ void SlamSystem::FlushPendingMapping() {
               << ", keyframe_overflow=" << pending_keyframe_overflow_
               << ", stale_map=" << map_cloud_no_match_
               << ", deskew_no_trajectory=" << deskew_no_trajectory_
-              << ", back_only_fallback=" << back_only_fallback_;
+              << ", back_only_fallback=" << back_only_fallback_
+              << ", dropped_no_mapping_cloud=" << dropped_keyframe_without_mapping_cloud_
+              << ", dropped_deskew_failure=" << dropped_keyframe_on_deskew_failure_;
 }
 
 void SlamSystem::Spin() {

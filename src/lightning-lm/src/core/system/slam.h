@@ -172,6 +172,8 @@ class SlamSystem {
     double mapping_wait_timeout_s_ = 1.5;
     double mapping_match_tolerance_s_ = 0.005;
     size_t pending_keyframe_limit_ = 30;
+    bool drop_keyframe_without_mapping_cloud_ = false;
+    bool drop_keyframe_on_deskew_failure_ = false;
     std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> raw_mapping_clouds_;
     std::deque<PendingMapCloud> pending_map_clouds_;
     std::deque<PendingKeyframe> pending_keyframes_;
@@ -187,6 +189,8 @@ class SlamSystem {
     size_t deskew_no_trajectory_ = 0;
     size_t map_cloud_no_match_ = 0;
     size_t back_only_fallback_ = 0;
+    size_t dropped_keyframe_without_mapping_cloud_ = 0;
+    size_t dropped_keyframe_on_deskew_failure_ = 0;
 
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_ = nullptr;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_ = nullptr;
