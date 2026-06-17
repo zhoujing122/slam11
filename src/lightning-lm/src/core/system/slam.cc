@@ -281,6 +281,18 @@ void SlamSystem::SaveMap(const std::string& path) {
 
     LOG(INFO) << "slam map saving to " << save_path;
 
+    DrainReadyMapping();
+
+    {
+        UL lock(mapping_mutex_);
+        if (split_pipeline_enabled_ &&
+            (!raw_mapping_clouds_.empty() || !pending_map_clouds_.empty() || !pending_keyframes_.empty())) {
+            LOG(WARNING) << "saving current mapping-accepted keyframe snapshot while split mapping queues are pending: raw="
+                         << raw_mapping_clouds_.size() << ", map=" << pending_map_clouds_.size()
+                         << ", keyframes=" << pending_keyframes_.size();
+        }
+    }
+
     const auto keyframes_snapshot = lio_->GetAllKeyframes();
     if (keyframes_snapshot.empty()) {
         LOG(ERROR) << "skip map save: no tracking keyframes available";
@@ -797,6 +809,19 @@ void SlamSystem::PublishReadyKeyframes(const std::vector<ReadyKeyframe>& ready_k
     for (const auto& ready : ready_keyframes) {
         HandleReadyKeyframe(ready.first, ready.second);
     }
+}
+
+void SlamSystem::DrainReadyMapping() {
+    if (!split_pipeline_enabled_) {
+        return;
+    }
+
+    sensor_msgs::msg::PointCloud2::SharedPtr raw_cloud;
+    while (PopRawMappingCloud(raw_cloud)) {
+        ProcessRawMappingCloud(raw_cloud);
+    }
+
+    PublishReadyKeyframes(TryPublishPendingKeyframes(false));
 }
 
 void SlamSystem::FlushPendingMapping() {

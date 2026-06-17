@@ -17,7 +17,7 @@ A keyframe retained by the back-LiDAR LIO tracking chain to preserve local-map a
 _Avoid_: drop keyframe, 删除关键帧
 
 **建图接收关键帧**:
-A tracking keyframe whose cloud has passed the split mapping pipeline and may feed loop closing, G2P5, RViz global maps, and saved global PCDs.
+A tracking keyframe whose cloud has passed the split mapping pipeline and may feed loop closing, G2P5, RViz global maps, and saved global PCDs. Saved maps are snapshots of currently accepted keyframes, not a promise that live input has fully quiesced.
 _Avoid_: ready keyframe, 补图成功关键帧
 
 **侧雷达等待超时**:

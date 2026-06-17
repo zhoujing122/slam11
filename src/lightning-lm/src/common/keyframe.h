@@ -84,7 +84,7 @@ class Keyframe {
 
     double timestamp_ = 0;
     CloudPtr cloud_ = nullptr;  /// 降采样之后的点云
-    bool mapping_accepted_ = true;
+    bool mapping_accepted_ = false;
 
     mutable std::mutex data_mutex_;
     SE3 pose_lio_;  // 前端的pose

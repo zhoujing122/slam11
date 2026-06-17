@@ -86,6 +86,7 @@ class SlamSystem {
     void ProcessMappingLidar(const sensor_msgs::msg::PointCloud2::SharedPtr& cloud);
 
     void FlushPendingMapping();
+    void DrainReadyMapping();
 
     /// 实时模式下的spin
     void Spin();
