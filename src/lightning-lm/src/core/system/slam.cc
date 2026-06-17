@@ -275,15 +275,43 @@ uint32_t SaveMapResultToResponse(lightning::SlamSystem::SaveMapResult result) {
         case Result::kEmptyGlobalMap:
             return 3;
         case Result::kWriteFailed:
-            return 1;
+            return 5;
+        case Result::kInvalidMapId:
+            return 6;
     }
-    return 1;
+    return 5;
+}
+
+bool IsSafeMapId(const std::string& map_id) {
+    if (map_id.empty() || map_id == "." || map_id == "..") {
+        return false;
+    }
+    for (char ch : map_id) {
+        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::filesystem::path StripTrailingSeparators(std::filesystem::path path) {
+    while (path.has_relative_path() && path.filename().empty()) {
+        path = path.parent_path();
+    }
+    return path;
 }
 }  // namespace
 
 void SlamSystem::SaveMap(const SaveMapService::Request::SharedPtr request,
                          SaveMapService::Response::SharedPtr response) {
     map_name_ = request->map_id;
+    if (!IsSafeMapId(map_name_)) {
+        LOG(ERROR) << "reject save map request with invalid map_id=" << map_name_;
+        response->response = SaveMapResultToResponse(SaveMapResult::kInvalidMapId);
+        return;
+    }
     std::string save_path = "./data/" + map_name_ + "/";
 
     response->response = SaveMapResultToResponse(SaveMap(save_path));
@@ -335,27 +363,31 @@ SlamSystem::SaveMapResult SlamSystem::SaveMap(const std::string& path) {
         return SaveMapResult::kEmptyGlobalMap;
     }
 
+    const auto target_path = StripTrailingSeparators(std::filesystem::path(save_path));
+    auto tmp_path = target_path;
+    tmp_path += ".tmp";
+    auto backup_path = target_path;
+    backup_path += ".backup";
+
     try {
-        if (!std::filesystem::exists(save_path)) {
-            std::filesystem::create_directories(save_path);
-        } else {
-            std::filesystem::remove_all(save_path);
-            std::filesystem::create_directories(save_path);
-        }
+        std::filesystem::remove_all(tmp_path);
+        std::filesystem::create_directories(tmp_path);
+        const auto tmp_save_path = tmp_path.string();
 
         TiledMap::Options tm_options;
-        tm_options.map_path_ = save_path;
+        tm_options.map_path_ = tmp_save_path;
 
         TiledMap tm(tm_options);
         SE3 start_pose = first_mapping_kf->GetOptPose();
-        tm.ConvertFromFullPCD(global_map, start_pose, save_path);
+        tm.ConvertFromFullPCD(global_map, start_pose, tmp_save_path);
 
-        if (pcl::io::savePCDFileBinaryCompressed(save_path + "/global.pcd", *global_map) != 0) {
+        if (pcl::io::savePCDFileBinaryCompressed((tmp_path / "global.pcd").string(), *global_map) != 0) {
             LOG(ERROR) << "failed to write global.pcd";
+            std::filesystem::remove_all(tmp_path);
             return SaveMapResult::kWriteFailed;
         }
-        // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_no_loop.pcd", *global_map_no_loop);
-        // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_raw.pcd", *global_map_raw);
+        // pcl::io::savePCDFileBinaryCompressed((tmp_path / "global_no_loop.pcd").string(), *global_map_no_loop);
+        // pcl::io::savePCDFileBinaryCompressed((tmp_path / "global_raw.pcd").string(), *global_map_raw);
 
         if (options_.with_gridmap_) {
             /// 存为ROS兼容的模式
@@ -379,14 +411,16 @@ SlamSystem::SaveMapResult SlamSystem::SaveMap(const std::string& path) {
                 }
             }
 
-            if (!cv::imwrite(save_path + "/map.pgm", nav_image)) {
+            if (!cv::imwrite((tmp_path / "map.pgm").string(), nav_image)) {
                 LOG(ERROR) << "failed to write map.pgm";
+                std::filesystem::remove_all(tmp_path);
                 return SaveMapResult::kWriteFailed;
             }
 
-            std::ofstream yamlFile(save_path + "/map.yaml");
+            std::ofstream yamlFile(tmp_path / "map.yaml");
             if (!yamlFile.is_open()) {
                 LOG(ERROR) << "failed to write map.yaml";
+                std::filesystem::remove_all(tmp_path);
                 return SaveMapResult::kWriteFailed;
             }
 
@@ -407,9 +441,25 @@ SlamSystem::SaveMapResult SlamSystem::SaveMap(const std::string& path) {
             yamlFile << emitter.c_str();
             if (!yamlFile.good()) {
                 LOG(ERROR) << "failed to flush map.yaml";
+                std::filesystem::remove_all(tmp_path);
                 return SaveMapResult::kWriteFailed;
             }
         }
+
+        std::filesystem::remove_all(backup_path);
+        const bool had_previous = std::filesystem::exists(target_path);
+        if (had_previous) {
+            std::filesystem::rename(target_path, backup_path);
+        }
+        try {
+            std::filesystem::rename(tmp_path, target_path);
+        } catch (...) {
+            if (had_previous && std::filesystem::exists(backup_path) && !std::filesystem::exists(target_path)) {
+                std::filesystem::rename(backup_path, target_path);
+            }
+            throw;
+        }
+        std::filesystem::remove_all(backup_path);
     } catch (const std::exception& exc) {
         LOG(ERROR) << "failed to save map: " << exc.what();
         return SaveMapResult::kWriteFailed;
@@ -559,8 +609,6 @@ bool SlamSystem::PopRawMappingCloud(sensor_msgs::msg::PointCloud2::SharedPtr& cl
 
 void SlamSystem::MappingWorkerLoop() {
     while (true) {
-        sensor_msgs::msg::PointCloud2::SharedPtr raw_cloud;
-        bool run_match = false;
         {
             UL lock(mapping_mutex_);
             mapping_cv_.wait_for(lock, std::chrono::milliseconds(50), [this]() {
@@ -570,25 +618,27 @@ void SlamSystem::MappingWorkerLoop() {
             if (mapping_worker_stop_ && raw_mapping_clouds_.empty()) {
                 break;
             }
+        }
 
-            if (!raw_mapping_clouds_.empty()) {
-                raw_cloud = raw_mapping_clouds_.front();
-                raw_mapping_clouds_.pop_front();
-            }
+        std::lock_guard<std::mutex> processing_lock(mapping_processing_mutex_);
+
+        sensor_msgs::msg::PointCloud2::SharedPtr raw_cloud;
+        const bool has_raw = PopRawMappingCloud(raw_cloud);
+
+        bool run_match = false;
+        {
+            UL lock(mapping_mutex_);
             run_match = mapping_work_requested_ || !pending_keyframes_.empty();
             mapping_work_requested_ = false;
         }
 
-        if (raw_cloud || run_match) {
-            std::lock_guard<std::mutex> processing_lock(mapping_processing_mutex_);
-            if (raw_cloud) {
-                ProcessRawMappingCloud(raw_cloud);
-                run_match = true;
-            }
+        if (has_raw) {
+            ProcessRawMappingCloud(raw_cloud);
+            run_match = true;
+        }
 
-            if (run_match) {
-                PublishReadyKeyframes(TryPublishPendingKeyframes(false));
-            }
+        if (run_match) {
+            PublishReadyKeyframes(TryPublishPendingKeyframes(false));
         }
     }
 }

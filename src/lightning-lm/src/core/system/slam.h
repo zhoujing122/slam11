@@ -80,6 +80,7 @@ class SlamSystem {
         kNoAcceptedKeyframes,
         kEmptyGlobalMap,
         kWriteFailed,
+        kInvalidMapId,
     };
 
     /// 保存地图，默认保存至./data/地图名/ 下方
