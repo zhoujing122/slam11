@@ -822,6 +822,7 @@ void LaserMapping::MakeKF() {
         LogCloudSourceStats("keyframe_input", keyframe_cloud);
     }
     Keyframe::Ptr kf = std::make_shared<Keyframe>(kf_id_++, keyframe_cloud, state_point_);
+    kf->SetMappingAccepted(!split_pipeline_enabled_);
 
     if (last_kf_) {
         /// opt pose 用之前的递推
@@ -1330,7 +1331,14 @@ CloudPtr LaserMapping::GetGlobalMap(bool use_lio_pose, bool use_voxel, float res
     const auto keyframes_snapshot = GetAllKeyframes();
 
     for (auto &kf : keyframes_snapshot) {
+        if (!kf->MappingAccepted()) {
+            continue;
+        }
+
         CloudPtr cloud = kf->GetCloud();
+        if (!cloud || cloud->empty()) {
+            continue;
+        }
 
         CloudPtr cloud_filter(new PointCloudType);
 

@@ -36,6 +36,16 @@ class Keyframe {
         cloud_ = cloud;
     }
 
+    bool MappingAccepted() const {
+        UL lock(data_mutex_);
+        return mapping_accepted_;
+    }
+
+    void SetMappingAccepted(bool accepted) {
+        UL lock(data_mutex_);
+        mapping_accepted_ = accepted;
+    }
+
     SE3 GetLIOPose() {
         UL lock(data_mutex_);
         return pose_lio_;
@@ -74,6 +84,7 @@ class Keyframe {
 
     double timestamp_ = 0;
     CloudPtr cloud_ = nullptr;  /// 降采样之后的点云
+    bool mapping_accepted_ = true;
 
     mutable std::mutex data_mutex_;
     SE3 pose_lio_;  // 前端的pose

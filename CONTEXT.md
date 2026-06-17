@@ -12,6 +12,14 @@ _Avoid_: 补图, 拆分补图, 后台补图
 A stable view of a keyframe's point cloud taken by a reader before it performs mapping, loop-closing, visualization, or map saving work.
 _Avoid_: 关键帧点云引用, 共享关键帧点云
 
+**跟踪关键帧**:
+A keyframe retained by the back-LiDAR LIO tracking chain to preserve local-map and trajectory continuity.
+_Avoid_: drop keyframe, 删除关键帧
+
+**建图接收关键帧**:
+A tracking keyframe whose cloud has passed the split mapping pipeline and may feed loop closing, G2P5, RViz global maps, and saved global PCDs.
+_Avoid_: ready keyframe, 补图成功关键帧
+
 **侧雷达等待超时**:
 The maximum time the fusion pipeline waits after a back LiDAR frame for matching chin or tail LiDAR data to arrive.
 _Avoid_: 同步超时, 补帧等待

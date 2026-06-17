@@ -88,7 +88,7 @@ class PointCloudMerger(Node):
         self.declare_parameter("cache_static_tf", True)
         self.declare_parameter("tf_lookup_timeout_s", 2.0)
         self.declare_parameter("dynamic_self_filter_tf_timeout_s", 0.003)
-        self.declare_parameter("allow_back_only_fallback", True)
+        self.declare_parameter("allow_back_only_fallback", False)
         self.declare_parameter("side_wait_timeout_s", 0.15)
         self.declare_parameter("max_pending_back_frames", 3)
         self.declare_parameter("chin_z_offset_m", 0.0)
