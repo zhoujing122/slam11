@@ -74,8 +74,16 @@ class SlamSystem {
     /// 开始建图，输入地图名称
     void StartSLAM(std::string map_name);
 
+    enum class SaveMapResult {
+        kSuccess,
+        kNoTrackingKeyframes,
+        kNoAcceptedKeyframes,
+        kEmptyGlobalMap,
+        kWriteFailed,
+    };
+
     /// 保存地图，默认保存至./data/地图名/ 下方
-    void SaveMap(const std::string& path = "");
+    SaveMapResult SaveMap(const std::string& path = "");
 
     /// 处理IMU
     void ProcessIMU(const lightning::IMUPtr& imu);
@@ -179,6 +187,7 @@ class SlamSystem {
     std::deque<PendingMapCloud> pending_map_clouds_;
     std::deque<PendingKeyframe> pending_keyframes_;
     std::mutex mapping_mutex_;
+    std::mutex mapping_processing_mutex_;
     std::condition_variable mapping_cv_;
     std::thread mapping_worker_;
     bool mapping_worker_stop_ = false;

@@ -264,16 +264,32 @@ void SlamSystem::StartSLAM(std::string map_name) {
     running_ = true;
 }
 
+namespace {
+uint32_t SaveMapResultToResponse(lightning::SlamSystem::SaveMapResult result) {
+    using Result = lightning::SlamSystem::SaveMapResult;
+    switch (result) {
+        case Result::kSuccess:
+            return 0;
+        case Result::kNoTrackingKeyframes:
+        case Result::kNoAcceptedKeyframes:
+        case Result::kEmptyGlobalMap:
+            return 3;
+        case Result::kWriteFailed:
+            return 1;
+    }
+    return 1;
+}
+}  // namespace
+
 void SlamSystem::SaveMap(const SaveMapService::Request::SharedPtr request,
                          SaveMapService::Response::SharedPtr response) {
     map_name_ = request->map_id;
     std::string save_path = "./data/" + map_name_ + "/";
 
-    SaveMap(save_path);
-    response->response = 0;
+    response->response = SaveMapResultToResponse(SaveMap(save_path));
 }
 
-void SlamSystem::SaveMap(const std::string& path) {
+SlamSystem::SaveMapResult SlamSystem::SaveMap(const std::string& path) {
     std::string save_path = path;
     if (save_path.empty()) {
         save_path = "./data/" + map_name_ + "/";
@@ -296,7 +312,7 @@ void SlamSystem::SaveMap(const std::string& path) {
     const auto keyframes_snapshot = lio_->GetAllKeyframes();
     if (keyframes_snapshot.empty()) {
         LOG(ERROR) << "skip map save: no tracking keyframes available";
-        return;
+        return SaveMapResult::kNoTrackingKeyframes;
     }
 
     Keyframe::Ptr first_mapping_kf = nullptr;
@@ -308,7 +324,7 @@ void SlamSystem::SaveMap(const std::string& path) {
     }
     if (!first_mapping_kf) {
         LOG(ERROR) << "skip map save: no mapping-accepted keyframes available";
-        return;
+        return SaveMapResult::kNoAcceptedKeyframes;
     }
 
     // auto global_map_no_loop = lio_->GetGlobalMap(true);
@@ -316,59 +332,64 @@ void SlamSystem::SaveMap(const std::string& path) {
     // auto global_map_raw = lio_->GetGlobalMap(!options_.with_loop_closing_, false, 0.1);
     if (!global_map || global_map->empty()) {
         LOG(ERROR) << "skip map save: global map is empty after filtering mapping-accepted keyframes";
-        return;
+        return SaveMapResult::kEmptyGlobalMap;
     }
 
-    if (!std::filesystem::exists(save_path)) {
-        std::filesystem::create_directories(save_path);
-    } else {
-        std::filesystem::remove_all(save_path);
-        std::filesystem::create_directories(save_path);
-    }
+    try {
+        if (!std::filesystem::exists(save_path)) {
+            std::filesystem::create_directories(save_path);
+        } else {
+            std::filesystem::remove_all(save_path);
+            std::filesystem::create_directories(save_path);
+        }
 
-    TiledMap::Options tm_options;
-    tm_options.map_path_ = save_path;
+        TiledMap::Options tm_options;
+        tm_options.map_path_ = save_path;
 
-    TiledMap tm(tm_options);
-    SE3 start_pose = first_mapping_kf->GetOptPose();
-    tm.ConvertFromFullPCD(global_map, start_pose, save_path);
+        TiledMap tm(tm_options);
+        SE3 start_pose = first_mapping_kf->GetOptPose();
+        tm.ConvertFromFullPCD(global_map, start_pose, save_path);
 
-    pcl::io::savePCDFileBinaryCompressed(save_path + "/global.pcd", *global_map);
-    // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_no_loop.pcd", *global_map_no_loop);
-    // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_raw.pcd", *global_map_raw);
+        if (pcl::io::savePCDFileBinaryCompressed(save_path + "/global.pcd", *global_map) != 0) {
+            LOG(ERROR) << "failed to write global.pcd";
+            return SaveMapResult::kWriteFailed;
+        }
+        // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_no_loop.pcd", *global_map_no_loop);
+        // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_raw.pcd", *global_map_raw);
 
-    if (options_.with_gridmap_) {
-        /// 存为ROS兼容的模式
-        auto map = g2p5_->GetNewestMap()->ToROS();
-        const int width = map.info.width;
-        const int height = map.info.height;
+        if (options_.with_gridmap_) {
+            /// 存为ROS兼容的模式
+            auto map = g2p5_->GetNewestMap()->ToROS();
+            const int width = map.info.width;
+            const int height = map.info.height;
 
-        cv::Mat nav_image(height, width, CV_8UC1);
-        for (int y = 0; y < height; ++y) {
-            const int rowStartIndex = y * width;
-            for (int x = 0; x < width; ++x) {
-                const int index = rowStartIndex + x;
-                int8_t data = map.data[index];
-                if (data == 0) {                                   // Free
-                    nav_image.at<uchar>(height - 1 - y, x) = 255;  // White
-                } else if (data == 100) {                          // Occupied
-                    nav_image.at<uchar>(height - 1 - y, x) = 0;    // Black
-                } else {                                           // Unknown
-                    nav_image.at<uchar>(height - 1 - y, x) = 128;  // Gray
+            cv::Mat nav_image(height, width, CV_8UC1);
+            for (int y = 0; y < height; ++y) {
+                const int rowStartIndex = y * width;
+                for (int x = 0; x < width; ++x) {
+                    const int index = rowStartIndex + x;
+                    int8_t data = map.data[index];
+                    if (data == 0) {                                   // Free
+                        nav_image.at<uchar>(height - 1 - y, x) = 255;  // White
+                    } else if (data == 100) {                          // Occupied
+                        nav_image.at<uchar>(height - 1 - y, x) = 0;    // Black
+                    } else {                                           // Unknown
+                        nav_image.at<uchar>(height - 1 - y, x) = 128;  // Gray
+                    }
                 }
             }
-        }
 
-        cv::imwrite(save_path + "/map.pgm", nav_image);
+            if (!cv::imwrite(save_path + "/map.pgm", nav_image)) {
+                LOG(ERROR) << "failed to write map.pgm";
+                return SaveMapResult::kWriteFailed;
+            }
 
-        /// yaml
-        std::ofstream yamlFile(save_path + "/map.yaml");
-        if (!yamlFile.is_open()) {
-            LOG(ERROR) << "failed to write map.yaml";
-            return;  // 文件打开失败
-        }
+            std::ofstream yamlFile(save_path + "/map.yaml");
+            if (!yamlFile.is_open()) {
+                LOG(ERROR) << "failed to write map.yaml";
+                return SaveMapResult::kWriteFailed;
+            }
 
-        try {
             YAML::Emitter emitter;
             emitter << YAML::BeginMap;
             emitter << YAML::Key << "image" << YAML::Value << "map.pgm";
@@ -381,18 +402,24 @@ void SlamSystem::SaveMap(const std::string& path) {
             emitter << YAML::Key << "negate" << YAML::Value << 0;
             emitter << YAML::Key << "occupied_thresh" << YAML::Value << 0.65;
             emitter << YAML::Key << "free_thresh" << YAML::Value << 0.25;
-
             emitter << YAML::EndMap;
 
             yamlFile << emitter.c_str();
-            yamlFile.close();
-        } catch (...) {
-            yamlFile.close();
-            return;
+            if (!yamlFile.good()) {
+                LOG(ERROR) << "failed to flush map.yaml";
+                return SaveMapResult::kWriteFailed;
+            }
         }
+    } catch (const std::exception& exc) {
+        LOG(ERROR) << "failed to save map: " << exc.what();
+        return SaveMapResult::kWriteFailed;
+    } catch (...) {
+        LOG(ERROR) << "failed to save map: unknown exception";
+        return SaveMapResult::kWriteFailed;
     }
 
     LOG(INFO) << "map saved";
+    return SaveMapResult::kSuccess;
 }
 
 void SlamSystem::ProcessIMU(const lightning::IMUPtr& imu) {
@@ -552,13 +579,16 @@ void SlamSystem::MappingWorkerLoop() {
             mapping_work_requested_ = false;
         }
 
-        if (raw_cloud) {
-            ProcessRawMappingCloud(raw_cloud);
-            run_match = true;
-        }
+        if (raw_cloud || run_match) {
+            std::lock_guard<std::mutex> processing_lock(mapping_processing_mutex_);
+            if (raw_cloud) {
+                ProcessRawMappingCloud(raw_cloud);
+                run_match = true;
+            }
 
-        if (run_match) {
-            PublishReadyKeyframes(TryPublishPendingKeyframes(false));
+            if (run_match) {
+                PublishReadyKeyframes(TryPublishPendingKeyframes(false));
+            }
         }
     }
 }
@@ -816,6 +846,7 @@ void SlamSystem::DrainReadyMapping() {
         return;
     }
 
+    std::lock_guard<std::mutex> processing_lock(mapping_processing_mutex_);
     sensor_msgs::msg::PointCloud2::SharedPtr raw_cloud;
     while (PopRawMappingCloud(raw_cloud)) {
         ProcessRawMappingCloud(raw_cloud);
@@ -829,6 +860,7 @@ void SlamSystem::FlushPendingMapping() {
         return;
     }
 
+    std::lock_guard<std::mutex> processing_lock(mapping_processing_mutex_);
     sensor_msgs::msg::PointCloud2::SharedPtr raw_cloud;
     while (PopRawMappingCloud(raw_cloud)) {
         ProcessRawMappingCloud(raw_cloud);
