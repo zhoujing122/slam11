@@ -126,7 +126,10 @@ class LaserMapping {
     /// 获取最新的点云
     CloudPtr GetRecentCloud();
 
-    std::vector<Keyframe::Ptr> GetAllKeyframes() { return all_keyframes_; }
+    std::vector<Keyframe::Ptr> GetAllKeyframes() const {
+        std::lock_guard<std::mutex> lock(keyframes_mutex_);
+        return all_keyframes_;
+    }
 
     /**
      * 计算全局地图
@@ -196,6 +199,7 @@ class LaserMapping {
     Vec3d offset_t_lidar_fixed_ = Vec3d::Zero();
     std::string map_file_path_;
 
+    mutable std::mutex keyframes_mutex_;
     std::vector<Keyframe::Ptr> all_keyframes_;
     Keyframe::Ptr last_kf_ = nullptr;
     int kf_id_ = 0;

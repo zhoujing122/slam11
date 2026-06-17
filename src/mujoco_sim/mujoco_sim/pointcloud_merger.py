@@ -41,7 +41,7 @@ from mujoco_sim.pointcloud_merger_core import (
     SourcePointFilter,
     merge_pointclouds,
     pointcloud_timestamp_range,
-    select_overlapping,
+    select_best_overlap,
     should_wait_for_overlapping_clouds,
 )
 
@@ -80,11 +80,14 @@ class PointCloudMerger(Node):
         # 10 Hz LiDAR -> scan period 100 ms. 10 ms tolerance keeps the merged
         # triplet temporally tight (within 1/10 of a scan). Loosen if hardware
         # latencies make this drop too many clouds.
+        # Deprecated compatibility alias; use side_match_tolerance_s.
         self.declare_parameter("sync_tolerance_s", 0.01)
+        self.declare_parameter("side_match_tolerance_s", -1.0)
         self.declare_parameter("cache_size", 20)
         # Gen 1 (rigid head): True. Gen 2 (movable head): False.
         self.declare_parameter("cache_static_tf", True)
         self.declare_parameter("tf_lookup_timeout_s", 2.0)
+        self.declare_parameter("dynamic_self_filter_tf_timeout_s", 0.003)
         self.declare_parameter("allow_back_only_fallback", True)
         self.declare_parameter("side_wait_timeout_s", 0.15)
         self.declare_parameter("max_pending_back_frames", 3)
@@ -125,11 +128,16 @@ class PointCloudMerger(Node):
         self.declare_parameter("dynamic_self_filter_padding_m", 0.03)
         self.declare_parameter("dynamic_self_filter_shape_json", "")
         self.declare_parameter("dynamic_self_filter_require_all_shapes", False)
+        self.declare_parameter("dynamic_self_filter_missing_policy", "degraded")
         # 0 disables periodic stats logging.
         self.declare_parameter("stats_period_s", 5.0)
 
         self.target_frame = self.get_parameter("target_frame").value
-        self.sync_tolerance_s = float(self.get_parameter("sync_tolerance_s").value)
+        legacy_sync_tolerance_s = float(self.get_parameter("sync_tolerance_s").value)
+        side_match_tolerance_s = float(self.get_parameter("side_match_tolerance_s").value)
+        self.side_match_tolerance_s = (
+            side_match_tolerance_s if side_match_tolerance_s >= 0.0 else legacy_sync_tolerance_s
+        )
         self.cache_size = int(self.get_parameter("cache_size").value)
         self.cache_static_tf = bool(self.get_parameter("cache_static_tf").value)
         self.allow_back_only_fallback = bool(
@@ -176,6 +184,17 @@ class PointCloudMerger(Node):
         self.dynamic_self_filter_require_all_shapes = bool(
             self.get_parameter("dynamic_self_filter_require_all_shapes").value
         )
+        self.dynamic_self_filter_missing_policy = str(
+            self.get_parameter("dynamic_self_filter_missing_policy").value
+        ).lower()
+        if self.dynamic_self_filter_require_all_shapes:
+            self.dynamic_self_filter_missing_policy = "strict"
+        if self.dynamic_self_filter_missing_policy not in {"strict", "degraded", "off"}:
+            self.get_logger().warn(
+                "unknown dynamic_self_filter_missing_policy=%s, fallback to degraded"
+                % self.dynamic_self_filter_missing_policy
+            )
+            self.dynamic_self_filter_missing_policy = "degraded"
         shape_json = str(self.get_parameter("dynamic_self_filter_shape_json").value)
         self.dynamic_self_filter_shapes = load_shapes(
             shape_json if shape_json else None,
@@ -183,6 +202,9 @@ class PointCloudMerger(Node):
         )
         self.tf_lookup_timeout = Duration(
             seconds=float(self.get_parameter("tf_lookup_timeout_s").value)
+        )
+        self.dynamic_self_filter_tf_timeout = Duration(
+            seconds=float(self.get_parameter("dynamic_self_filter_tf_timeout_s").value)
         )
         # source_frame -> (rotation_matrix_3x3, translation_xyz)
         self._tf_cache = {}
@@ -230,7 +252,7 @@ class PointCloudMerger(Node):
 
         self.get_logger().info(
             "pointcloud_merger: back=%s chin=%s tail=%s -> %s frame=%s "
-            "tolerance=%.3fs cache_static_tf=%s tf_timeout=%.1fs "
+            "side_match_tolerance=%.3fs cache_static_tf=%s tf_timeout=%.1fs "
             "allow_back_only_fallback=%s side_wait_timeout=%.3fs "
             "max_pending_back=%d "
             "chin_z_offset=%.3fm tail_z_offset=%.3fm "
@@ -240,7 +262,7 @@ class PointCloudMerger(Node):
             "tail_driver_to_link_rpy=[%.2f, %.2f, %.2f]deg "
             "min_range=[back %.2f, chin %.2f, tail %.2f]m "
             "z_window=[back %.2f..%.2f, chin %.2f..%.2f, tail %.2f..%.2f]m "
-            "dynamic_self_filter=%s shapes=%d "
+            "dynamic_self_filter=%s shapes=%d missing_policy=%s dynamic_tf_timeout=%.1fms "
             "stats_period=%.1fs"
             % (
                 self.get_parameter("back_topic").value,
@@ -248,7 +270,7 @@ class PointCloudMerger(Node):
                 self.get_parameter("tail_topic").value,
                 self.get_parameter("output_topic").value,
                 self.target_frame,
-                self.sync_tolerance_s,
+                self.side_match_tolerance_s,
                 self.cache_static_tf,
                 self.tf_lookup_timeout.nanoseconds / 1e9,
                 self.allow_back_only_fallback,
@@ -279,6 +301,8 @@ class PointCloudMerger(Node):
                 self.source_filters["radar_r_Link"].max_z or 999.0,
                 self.dynamic_self_filter_enabled,
                 len(self.dynamic_self_filter_shapes),
+                self.dynamic_self_filter_missing_policy,
+                self.dynamic_self_filter_tf_timeout.nanoseconds / 1e6,
                 stats_period,
             )
         )
@@ -290,6 +314,8 @@ class PointCloudMerger(Node):
             "drop_no_chin_tail": 0,
             "drop_tf": 0,
             "drop_merge_error": 0,
+            "drop_self_filter": 0,
+            "empty_output_frames_total": 0,
             "drop_pending_overflow": 0,
             "fallback_missing_side": 0,
             "fallback_back_only_count": 0,
@@ -301,6 +327,12 @@ class PointCloudMerger(Node):
             "points_tail": 0,
             "max_sync_delta_s": 0.0,  # worst |chin-back| or |tail-back| this window
             "self_filter_removed": 0,
+            "self_filter_input_points": 0,
+            "self_filter_requested_shapes": 0,
+            "self_filter_active_shapes": 0,
+            "self_filter_missing_shapes": 0,
+            "self_filter_degraded_frames": 0,
+            "self_filter_tf_lookup_duration_ms": 0.0,
         }
 
     def _log_stats(self):
@@ -310,6 +342,7 @@ class PointCloudMerger(Node):
             + s["drop_no_chin_tail"]
             + s["drop_tf"]
             + s["drop_merge_error"]
+            + s["drop_self_filter"]
             + s["drop_pending_overflow"]
         )
         rate_hz = s["published"] / self._stats_period if self._stats_period > 0 else 0.0
@@ -322,9 +355,10 @@ class PointCloudMerger(Node):
             avg_pts = avg_back = avg_chin = avg_tail = 0
         self.get_logger().info(
             "stats[%.1fs]: pub=%d (%.1fHz) drop=%d "
-            "(no_sync=%d, pending_overflow=%d, tf=%d, merge=%d, fallback=%d) "
+            "(no_sync=%d, pending_overflow=%d, tf=%d, merge=%d, self_filter=%d, empty=%d, fallback=%d) "
             "stalls=(chin=%d tail=%d) pts/frame=%d "
-            "(back=%d chin=%d tail=%d) self_filter_removed=%d max_sync_dt=%.1fms"
+            "(back=%d chin=%d tail=%d) self_filter_removed=%d "
+            "self_filter_shapes=%d/%d missing=%d degraded=%d tf_ms=%.1f max_sync_dt=%.1fms"
             % (
                 self._stats_period,
                 s["published"], rate_hz,
@@ -333,23 +367,31 @@ class PointCloudMerger(Node):
                     + s["drop_pending_overflow"]
                     + s["drop_tf"]
                     + s["drop_merge_error"]
+                    + s["drop_self_filter"]
                 ),
                 s["drop_no_chin_tail"],
                 s["drop_pending_overflow"],
                 s["drop_tf"],
                 s["drop_merge_error"],
+                s["drop_self_filter"],
+                s["empty_output_frames_total"],
                 s["fallback_back_only_count"],
                 s["chin_stall_count"],
                 s["tail_stall_count"],
                 avg_pts, avg_back, avg_chin, avg_tail,
                 s["self_filter_removed"],
+                s["self_filter_active_shapes"],
+                s["self_filter_requested_shapes"],
+                s["self_filter_missing_shapes"],
+                s["self_filter_degraded_frames"],
+                s["self_filter_tf_lookup_duration_ms"],
                 s["max_sync_delta_s"] * 1000.0,
             )
         )
         if attempts > 0 and s["published"] == 0:
             self.get_logger().warn(
                 "merger received %d back clouds but published 0 — check topics, "
-                "TF tree, and sync tolerance" % attempts
+                "TF tree, and side match tolerance" % attempts
             )
         self._stats = self._fresh_stats()
 
@@ -413,12 +455,16 @@ class PointCloudMerger(Node):
         msg = back.cloud
         target_stamp = back.stamp
         timestamp_window = (back.timestamp_min, back.timestamp_max)
-        chin_matches = select_overlapping(self.chin_cache, timestamp_window)
-        tail_matches = select_overlapping(self.tail_cache, timestamp_window)
+        chin_match = select_best_overlap(
+            self.chin_cache, timestamp_window, self.side_match_tolerance_s
+        )
+        tail_match = select_best_overlap(
+            self.tail_cache, timestamp_window, self.side_match_tolerance_s
+        )
         missing = []
-        if not chin_matches:
+        if chin_match is None:
             missing.append("chin")
-        if not tail_matches:
+        if tail_match is None:
             missing.append("tail")
 
         wait_timed_out = False
@@ -473,15 +519,19 @@ class PointCloudMerger(Node):
 
         back_mid = 0.5 * (back.timestamp_min + back.timestamp_max)
         sync_dt = 0.0
-        for cached in chin_matches + tail_matches:
+        side_matches = []
+        if chin_match is not None:
+            side_matches.append(("chin", chin_match))
+        if tail_match is not None:
+            side_matches.append(("tail", tail_match))
+        for _, cached in side_matches:
             side_mid = 0.5 * (cached.timestamp_min + cached.timestamp_max)
             sync_dt = max(sync_dt, abs(side_mid - back_mid))
         if sync_dt > self._stats["max_sync_delta_s"]:
             self._stats["max_sync_delta_s"] = sync_dt
 
         labeled_clouds = [("back", back)]
-        labeled_clouds.extend(("chin", cached) for cached in chin_matches)
-        labeled_clouds.extend(("tail", cached) for cached in tail_matches)
+        labeled_clouds.extend(side_matches)
 
         transforms = []
         source_names = []
@@ -495,6 +545,12 @@ class PointCloudMerger(Node):
                 transform[0],
                 self._driver_to_link_rotation_for_source(cloud.header.frame_id),
             )
+            try:
+                point_filter = self._point_filter_for_cloud(cloud, source_name)
+            except RuntimeError as exc:
+                self._stats["drop_self_filter"] += 1
+                self.get_logger().warn("drop cloud: dynamic self-filter unavailable: %s" % exc)
+                return True
             source_names.append(source_name)
             transforms.append((
                 cloud,
@@ -502,7 +558,7 @@ class PointCloudMerger(Node):
                 transform[1],
                 self._extra_translation_for_source(cloud.header.frame_id),
                 self._extra_rotation_for_source(cloud.header.frame_id),
-                self._point_filter_for_cloud(cloud, source_name),
+                point_filter,
                 self._source_id_for_source_name(source_name),
             ))
 
@@ -516,6 +572,8 @@ class PointCloudMerger(Node):
                 timestamp_window=timestamp_window,
             )
         except ValueError as exc:
+            if "empty after filtering" in str(exc):
+                self._stats["empty_output_frames_total"] += 1
             self._stats["drop_merge_error"] += 1
             self.get_logger().error("failed to merge point clouds: %s" % exc)
             return True
@@ -584,30 +642,69 @@ class PointCloudMerger(Node):
         if not self.dynamic_self_filter_enabled:
             return static_filter
 
+        lookup_start = time.monotonic()
+
         def lookup_shape(shape_frame):
             return self._lookup_self_filter_transform(shape_frame, cloud.header.stamp)
 
         dynamic_filter = make_dynamic_self_filter(
             self.dynamic_self_filter_shapes,
             lookup_shape,
-            require_all_shapes=self.dynamic_self_filter_require_all_shapes,
+            require_all_shapes=False,
         )
+        lookup_ms = (time.monotonic() - lookup_start) * 1000.0
+        missing_count = len(dynamic_filter.missing_frames)
+        requested_count = dynamic_filter.requested_count
+        active_count = dynamic_filter.active_count
+
+        self._stats["self_filter_requested_shapes"] += requested_count
+        self._stats["self_filter_active_shapes"] += active_count
+        self._stats["self_filter_missing_shapes"] += missing_count
+        self._stats["self_filter_tf_lookup_duration_ms"] += lookup_ms
+        self._stats[f"{source_name}_dynamic_filter_requested_shapes"] = (
+            self._stats.get(f"{source_name}_dynamic_filter_requested_shapes", 0) + requested_count
+        )
+        self._stats[f"{source_name}_dynamic_filter_active_shapes"] = (
+            self._stats.get(f"{source_name}_dynamic_filter_active_shapes", 0) + active_count
+        )
+        self._stats[f"{source_name}_dynamic_filter_missing_shapes"] = (
+            self._stats.get(f"{source_name}_dynamic_filter_missing_shapes", 0) + missing_count
+        )
+
+        if missing_count:
+            if self.dynamic_self_filter_missing_policy != "off":
+                self._stats["self_filter_degraded_frames"] += 1
+            missing_preview = ",".join(dynamic_filter.missing_frames[:8])
+            if self.dynamic_self_filter_missing_policy == "strict":
+                raise RuntimeError(
+                    "missing self-filter TF frames for %s: %s" % (source_name, missing_preview)
+                )
+            if self.dynamic_self_filter_missing_policy == "degraded":
+                self.get_logger().warn(
+                    "dynamic self-filter degraded for %s: active=%d/%d missing=%d [%s]"
+                    % (source_name, active_count, requested_count, missing_count, missing_preview),
+                    throttle_duration_sec=2.0,
+                )
+
         if not dynamic_filter.active():
-            self.get_logger().warn(
-                "dynamic self-filter is enabled but no robot body boxes have TF into %s"
-                % self.target_frame,
-                throttle_duration_sec=2.0,
-            )
+            message = "dynamic self-filter is enabled but no robot body boxes have TF into %s" % self.target_frame
+            if self.dynamic_self_filter_missing_policy == "strict":
+                raise RuntimeError(message)
+            self.get_logger().warn(message, throttle_duration_sec=2.0)
 
         class StatsFilter:
             def active(self_inner):
                 return dynamic_filter.active()
 
             def keep_mask(self_inner, xyz):
+                self._stats["self_filter_input_points"] += int(xyz.shape[0])
                 keep = dynamic_filter.keep_mask(xyz)
                 removed = int(xyz.shape[0] - keep.sum())
                 if removed:
                     self._stats["self_filter_removed"] += removed
+                    self._stats[f"{source_name}_dynamic_filter_removed"] = (
+                        self._stats.get(f"{source_name}_dynamic_filter_removed", 0) + removed
+                    )
                 return keep
 
         return CompositePointFilter([static_filter, StatsFilter()])
@@ -653,11 +750,18 @@ class PointCloudMerger(Node):
         if source_frame == self.target_frame:
             return IDENTITY_ROTATION, ZERO_TRANSLATION
         try:
+            if not self.tf_buffer.can_transform(
+                self.target_frame,
+                source_frame,
+                cloud_stamp,
+                timeout=Duration(seconds=0.0),
+            ):
+                return None
             transform = self.tf_buffer.lookup_transform(
                 self.target_frame,
                 source_frame,
                 cloud_stamp,
-                timeout=self.tf_lookup_timeout,
+                timeout=self.dynamic_self_filter_tf_timeout,
             )
         except Exception:
             return None

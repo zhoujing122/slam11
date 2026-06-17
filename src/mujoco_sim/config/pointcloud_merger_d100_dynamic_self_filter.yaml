@@ -7,7 +7,7 @@ pointcloud_merger:
     output_topic: /merged/LIDAR/POINTS
 
     # Back is the master scan. Side lidars are selected by per-point timestamp overlap.
-    sync_tolerance_s: 0.01
+    side_match_tolerance_s: 0.01
     cache_size: 20
     allow_back_only_fallback: true
     side_wait_timeout_s: 1.0
@@ -17,6 +17,7 @@ pointcloud_merger:
     # queried at each cloud stamp internally.
     cache_static_tf: true
     tf_lookup_timeout_s: 2.0
+    dynamic_self_filter_tf_timeout_s: 0.003
 
     # RoboSense driver frame correction currently used by the D100 chin Airy path.
     chin_driver_to_link_roll_deg: 0.0
@@ -32,5 +33,6 @@ pointcloud_merger:
     dynamic_self_filter_padding_m: 0.03
     dynamic_self_filter_shape_json: ""
     dynamic_self_filter_require_all_shapes: false
+    dynamic_self_filter_missing_policy: degraded
 
     stats_period_s: 5.0

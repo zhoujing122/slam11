@@ -258,6 +258,12 @@ void SlamSystem::SaveMap(const std::string& path) {
 
     LOG(INFO) << "slam map saving to " << save_path;
 
+    const auto keyframes_snapshot = lio_->GetAllKeyframes();
+    if (keyframes_snapshot.empty()) {
+        LOG(ERROR) << "skip map save: no keyframes available";
+        return;
+    }
+
     if (!std::filesystem::exists(save_path)) {
         std::filesystem::create_directories(save_path);
     } else {
@@ -273,7 +279,7 @@ void SlamSystem::SaveMap(const std::string& path) {
     tm_options.map_path_ = save_path;
 
     TiledMap tm(tm_options);
-    SE3 start_pose = lio_->GetAllKeyframes().front()->GetOptPose();
+    SE3 start_pose = keyframes_snapshot.front()->GetOptPose();
     tm.ConvertFromFullPCD(global_map, start_pose, save_path);
 
     pcl::io::savePCDFileBinaryCompressed(save_path + "/global.pcd", *global_map);
@@ -637,13 +643,15 @@ std::vector<SlamSystem::ReadyKeyframe> SlamSystem::TryPublishPendingKeyframes(bo
                 map_cloud_no_match_++;
             }
 
+            double best_delta = std::numeric_limits<double>::max();
             for (size_t i = 0; i < pending_map_clouds_.size(); ++i) {
                 const auto& candidate = pending_map_clouds_[i];
-                if (std::abs(candidate.end_time - front_kf.reference_time) <= mapping_match_tolerance_s_) {
+                const double delta = std::abs(candidate.end_time - front_kf.reference_time);
+                if (delta <= mapping_match_tolerance_s_ && delta < best_delta) {
+                    best_delta = delta;
                     map_cloud = candidate;
                     map_index = i;
                     has_match = true;
-                    break;
                 }
             }
 

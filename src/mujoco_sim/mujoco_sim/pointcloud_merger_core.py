@@ -133,6 +133,36 @@ def select_overlapping(candidates, timestamp_window):
     return matches
 
 
+def select_best_overlap(candidates, timestamp_window, tolerance_s):
+    """Return the best single cloud overlapping ``timestamp_window``.
+
+    The candidate must overlap the reference window and its scan midpoint must
+    be within ``tolerance_s`` of the reference midpoint. Candidates are ranked
+    by larger overlap first, then smaller midpoint delta.
+    """
+    start, end = timestamp_window
+    reference_mid = 0.5 * (start + end)
+    best = None
+    best_score = None
+    for candidate in candidates:
+        overlap_start = max(start, candidate.timestamp_min)
+        overlap_end = min(end, candidate.timestamp_max)
+        overlap = overlap_end - overlap_start
+        if overlap <= 0.0:
+            continue
+
+        candidate_mid = 0.5 * (candidate.timestamp_min + candidate.timestamp_max)
+        midpoint_delta = abs(candidate_mid - reference_mid)
+        if midpoint_delta > tolerance_s:
+            continue
+
+        score = (overlap, -midpoint_delta)
+        if best_score is None or score > best_score:
+            best = candidate
+            best_score = score
+    return best
+
+
 def select_available_clouds(back, chin, tail, allow_back_only_fallback=True):
     """Return clouds to merge, missing side names, and max side sync delta."""
     missing = []
@@ -179,6 +209,7 @@ def pointcloud_timestamp_range(cloud):
     """Return the inclusive min/max RoboSense timestamp in ``cloud``."""
     layout = _layout(cloud)
     _validate_layout(layout)
+    _validate_cloud_data(cloud)
     dtype = _layout_to_dtype(cloud)
 
     n = int(cloud.width) * int(cloud.height)
@@ -251,6 +282,7 @@ def merge_pointclouds(cloud_transforms, timestamp_window=None):
             raise ValueError("cloud transform item must have 3, 4, 5, 6, or 7 entries")
         if _layout(cloud) != layout:
             raise ValueError("all point clouds must use the same PointCloud2 layout")
+        _validate_cloud_data(cloud)
 
         n = int(cloud.width) * int(cloud.height)
         if n == 0:
@@ -310,18 +342,7 @@ def merge_pointclouds(cloud_transforms, timestamp_window=None):
     is_dense = all(bool(item[0].is_dense) for item in cloud_transforms)
 
     if not pieces:
-        return MergedPointCloud(
-            height=1, width=0,
-            fields=output_fields,
-            is_bigendian=False,
-            point_step=output_point_step,
-            row_step=0,
-            data=b'',
-            is_dense=is_dense,
-            min_timestamp=0.0,
-            max_timestamp=0.0,
-            source_point_counts=tuple(source_point_counts),
-        )
+        raise ValueError("merged point cloud is empty after filtering")
 
     merged = np.concatenate(pieces)
     order = np.argsort(merged['timestamp'], kind='stable')
@@ -345,13 +366,22 @@ def merge_pointclouds(cloud_transforms, timestamp_window=None):
 
 
 def _layout(cloud):
-    return {
-        field.name: (field.offset, field.datatype, field.count)
-        for field in cloud.fields
-    }
+    return (
+        tuple(
+            (field.name, int(field.offset), int(field.datatype), int(field.count))
+            for field in cloud.fields
+        ),
+        int(cloud.point_step),
+        bool(cloud.is_bigendian),
+    )
 
 
 def _validate_layout(layout):
+    fields, point_step, is_bigendian = layout
+    if is_bigendian:
+        raise ValueError("big-endian PointCloud2 data is not supported")
+
+    field_map = {name: (offset, datatype, count) for name, offset, datatype, count in fields}
     required = {
         "x": FLOAT32,
         "y": FLOAT32,
@@ -359,15 +389,37 @@ def _validate_layout(layout):
         "timestamp": FLOAT64,
     }
     for name, datatype in required.items():
-        if name not in layout:
+        if name not in field_map:
             raise ValueError(f"PointCloud2 field '{name}' is required")
-        if layout[name][1] != datatype:
+        if field_map[name][1] != datatype:
             raise ValueError(f"PointCloud2 field '{name}' has unexpected datatype")
 
-    if layout["x"][0] + 4 != layout["y"][0] or layout["y"][0] + 4 != layout["z"][0]:
+    if field_map["x"][0] + 4 != field_map["y"][0] or field_map["y"][0] + 4 != field_map["z"][0]:
         raise ValueError("x, y, z fields must be contiguous FLOAT32 values")
 
+    max_field_end = max(
+        offset + np.dtype(_DATATYPE_TO_NUMPY[datatype]).itemsize * count
+        for _, offset, datatype, count in fields
+        if datatype in _DATATYPE_TO_NUMPY
+    )
+    if point_step < max_field_end:
+        raise ValueError("PointCloud2 point_step is smaller than its fields require")
+
     return True
+
+
+def _validate_cloud_data(cloud):
+    expected_size = int(cloud.row_step) * int(cloud.height)
+    if len(cloud.data) < expected_size:
+        raise ValueError(
+            f"PointCloud2 data truncated: {len(cloud.data)} < {expected_size}"
+        )
+    expected_row_step = int(cloud.point_step) * int(cloud.width)
+    if int(cloud.row_step) != expected_row_step:
+        raise ValueError(
+            f"PointCloud2 row_step with padding is not supported: "
+            f"{cloud.row_step} != {expected_row_step}"
+        )
 
 
 def _layout_to_dtype(reference):

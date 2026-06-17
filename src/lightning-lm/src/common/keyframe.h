@@ -26,9 +26,12 @@ class Keyframe {
     }
 
     unsigned long GetID() const { return id_; }
-    CloudPtr GetCloud() const { return cloud_; }
+    CloudPtr GetCloud() const {
+        UL lock(data_mutex_);
+        return cloud_;
+    }
 
-    void SetCloud(CloudPtr cloud) {
+    void SetCloud(const CloudPtr& cloud) {
         UL lock(data_mutex_);
         cloud_ = cloud;
     }
@@ -72,7 +75,7 @@ class Keyframe {
     double timestamp_ = 0;
     CloudPtr cloud_ = nullptr;  /// 降采样之后的点云
 
-    std::mutex data_mutex_;
+    mutable std::mutex data_mutex_;
     SE3 pose_lio_;  // 前端的pose
     SE3 pose_opt_;  // 后端优化后的pose
 

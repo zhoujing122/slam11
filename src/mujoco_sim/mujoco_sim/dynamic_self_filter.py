@@ -44,10 +44,15 @@ class DynamicSelfFilter:
         transforms: list[tuple[BoxShape, np.ndarray, np.ndarray]],
         stats: dict[str, int] | None = None,
         stats_prefix: str = "",
+        requested_count: int = 0,
+        missing_frames: Iterable[str] = (),
     ) -> None:
         self._transforms = transforms
         self._stats = stats
         self._stats_prefix = stats_prefix
+        self.requested_count = int(requested_count)
+        self.active_count = len(transforms)
+        self.missing_frames = tuple(sorted(set(missing_frames)))
 
     def active(self) -> bool:
         return bool(self._transforms)
@@ -135,6 +140,7 @@ def make_dynamic_self_filter(
     stats_prefix: str = "",
     require_all_shapes: bool = False,
 ) -> DynamicSelfFilter:
+    shapes = list(shapes)
     transforms: list[tuple[BoxShape, np.ndarray, np.ndarray]] = []
     missing: list[str] = []
     for shape in shapes:
@@ -152,4 +158,10 @@ def make_dynamic_self_filter(
         )
     if require_all_shapes and missing:
         raise KeyError(f"missing self-filter TF frames: {sorted(set(missing))}")
-    return DynamicSelfFilter(transforms, stats=stats, stats_prefix=stats_prefix)
+    return DynamicSelfFilter(
+        transforms,
+        stats=stats,
+        stats_prefix=stats_prefix,
+        requested_count=len(shapes),
+        missing_frames=missing,
+    )

@@ -36,6 +36,32 @@ class DynamicSelfFilterTest(unittest.TestCase):
         self.assertEqual(point_filter.keep_mask(xyz).tolist(), [False, True])
         self.assertEqual(stats["trunk"], 1)
 
+
+    def test_reports_requested_active_and_missing_shapes(self):
+        present = BoxShape(
+            name="present",
+            frame="present",
+            center=np.zeros(3),
+            half_size=np.array([0.5, 0.5, 0.5], dtype=np.float64),
+        )
+        missing = BoxShape(
+            name="missing",
+            frame="missing",
+            center=np.zeros(3),
+            half_size=np.array([0.5, 0.5, 0.5], dtype=np.float64),
+        )
+
+        def lookup(frame):
+            if frame == "present":
+                return np.eye(3), np.zeros(3, dtype=np.float64)
+            return None
+
+        point_filter = make_dynamic_self_filter([present, missing], lookup)
+
+        self.assertEqual(point_filter.requested_count, 2)
+        self.assertEqual(point_filter.active_count, 1)
+        self.assertEqual(point_filter.missing_frames, ("missing",))
+
     def test_composite_filter_applies_static_and_dynamic_filters(self):
         static_filter = SourcePointFilter(min_x=0.0)
         dynamic_filter = SourcePointFilter(exclude_min_x=0.8, exclude_max_x=1.2,

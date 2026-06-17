@@ -839,6 +839,7 @@ void LaserMapping::MakeKF() {
               << state_point_.timestamp_;
 
     if (options_.is_in_slam_mode_) {
+        std::lock_guard<std::mutex> lock(keyframes_mutex_);
         all_keyframes_.emplace_back(kf);
     }
 
@@ -1326,7 +1327,9 @@ CloudPtr LaserMapping::GetGlobalMap(bool use_lio_pose, bool use_voxel, float res
     pcl::VoxelGrid<PointType> voxel;
     voxel.setLeafSize(res, res, res);
 
-    for (auto &kf : all_keyframes_) {
+    const auto keyframes_snapshot = GetAllKeyframes();
+
+    for (auto &kf : keyframes_snapshot) {
         CloudPtr cloud = kf->GetCloud();
 
         CloudPtr cloud_filter(new PointCloudType);

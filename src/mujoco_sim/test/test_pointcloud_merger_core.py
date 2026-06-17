@@ -12,6 +12,7 @@ from mujoco_sim.pointcloud_merger_core import (
     merge_pointclouds,
     pointcloud_timestamp_range,
     select_nearest,
+    select_best_overlap,
     select_overlapping,
     should_wait_for_overlapping_clouds,
     should_wait_for_side_clouds,
@@ -207,6 +208,62 @@ class PointCloudMergerCoreTest(unittest.TestCase):
         self.assertEqual(merged.source_point_counts, (1,))
         self.assertEqual(unpack_point(merged.data, 0),
                          (2.0, 0.0, 0.0, 10.0, 4, 100.00))
+
+
+    def test_select_best_overlap_prefers_overlap_then_midpoint_delta(self):
+        older = SimpleNamespace(timestamp_min=9.90, timestamp_max=9.99)
+        narrow = SimpleNamespace(timestamp_min=10.02, timestamp_max=10.04)
+        best = SimpleNamespace(timestamp_min=9.98, timestamp_max=10.08)
+        too_far = SimpleNamespace(timestamp_min=10.09, timestamp_max=10.19)
+
+        self.assertIs(
+            select_best_overlap([older, narrow, best, too_far], (10.00, 10.10), 0.05),
+            best,
+        )
+        self.assertIsNone(
+            select_best_overlap([too_far], (10.00, 10.10), 0.005),
+        )
+
+    def test_merge_rejects_point_step_mismatch(self):
+        back = make_cloud([
+            {"x": 0.0, "y": 0.0, "z": 0.0, "intensity": 1.0, "ring": 0, "timestamp": 100.00},
+        ])
+        chin = make_cloud([
+            {"x": 1.0, "y": 0.0, "z": 0.0, "intensity": 2.0, "ring": 0, "timestamp": 100.01},
+        ])
+        chin = SimpleNamespace(**{**chin.__dict__, "point_step": POINT_STEP + 4})
+
+        with self.assertRaisesRegex(ValueError, "same PointCloud2 layout"):
+            merge_pointclouds([
+                (back, ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)), (0.0, 0.0, 0.0)),
+                (chin, ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)), (0.0, 0.0, 0.0)),
+            ])
+
+    def test_timestamp_range_rejects_truncated_data(self):
+        cloud = make_cloud([
+            {"x": 0.0, "y": 0.0, "z": 0.0, "intensity": 1.0, "ring": 0, "timestamp": 100.00},
+        ])
+        cloud = SimpleNamespace(**{**cloud.__dict__, "data": cloud.data[:-1]})
+
+        with self.assertRaisesRegex(ValueError, "data truncated"):
+            pointcloud_timestamp_range(cloud)
+
+    def test_merge_rejects_empty_output_after_filtering(self):
+        cloud = make_cloud([
+            {"x": 0.0, "y": 0.0, "z": 0.0, "intensity": 1.0, "ring": 0, "timestamp": 100.00},
+        ])
+
+        with self.assertRaisesRegex(ValueError, "empty after filtering"):
+            merge_pointclouds([
+                (
+                    cloud,
+                    ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+                    (0.0, 0.0, 0.0),
+                    (0.0, 0.0, 0.0),
+                    None,
+                    SourcePointFilter(min_x=1.0),
+                ),
+            ])
 
     def test_select_overlapping_returns_all_clouds_that_intersect_window(self):
         older = SimpleNamespace(stamp=9.9, timestamp_min=9.90, timestamp_max=9.99)
